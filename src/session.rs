@@ -91,6 +91,24 @@ impl SavedClient {
     }
 }
 
+/// Order-independent description of a snapshot for comparing two saves: one sorted
+/// entry per window of (class, workspace, floating, position, size, argv). Addresses,
+/// pids and ordering are deliberately left out.
+pub fn fingerprint(clients: &[SavedClient]) -> Vec<String> {
+    let mut entries: Vec<String> = clients
+        .iter()
+        .map(|c| {
+            let k = &c.client;
+            format!(
+                "{}|{}|{}|{:?}|{:?}|{:?}",
+                k.class, k.workspace.id, k.floating, k.at, k.size, c.argv
+            )
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
 /// Write a file by writing a sibling temp file then renaming it over the target,
 /// so an interrupted save never leaves a truncated snapshot behind
 fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
@@ -414,6 +432,25 @@ mod tests {
         // Still readable as a plain client list by older consumers
         let plain: Vec<Client> = serde_json::from_str(&json).unwrap();
         assert_eq!(plain[0], saved.client);
+    }
+
+    #[test]
+    fn test_fingerprint_ignores_address_pid_and_order_but_not_geometry() {
+        let saved = |class: &str, at: (i16, i16), pid: i32| {
+            let mut client = client(class, "t", 1, false, at, (10, 10));
+            client.pid = pid;
+            SavedClient { client, argv: Some(vec![class.to_string()]), cwd: None }
+        };
+        let before = vec![saved("brave", (0, 0), 10), saved("brave", (5, 0), 10), saved("kitty", (9, 9), 20)];
+        // After a reload: new pids, new addresses, different order
+        let mut after = vec![saved("kitty", (9, 9), 77), saved("brave", (5, 0), 55), saved("brave", (0, 0), 55)];
+        for (i, c) in after.iter_mut().enumerate() {
+            c.client.address = hyprland::shared::Address::new(format!("0xf{i}"));
+        }
+        assert_eq!(fingerprint(&before), fingerprint(&after));
+
+        after[1].client.at = (6, 0);
+        assert_ne!(fingerprint(&before), fingerprint(&after));
     }
 
     #[test]
