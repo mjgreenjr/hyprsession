@@ -3,8 +3,9 @@ use hyprland::event_listener::EventListener;
 use hyprland::prelude::*;
 use hyprland::shared::Address;
 use std::fs::File;
-use std::io::{read_to_string, Write};
-use crate::command_detection::fetch_command;
+use std::io::read_to_string;
+use crate::command_detection::{fetch_command, read_argv, read_cwd};
+use serde::{Deserialize, Serialize};
 use crate::dispatch::{Dialect, Dispatcher, Op, WorkspaceTarget};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -37,6 +38,81 @@ macro_rules! to_base_dir {
             [$base_path, $name].iter().collect::<PathBuf>()
         }
     };
+}
+
+/// A client as stored in clients.json: the live client data plus what is needed to
+/// relaunch it. The extra fields are optional because older snapshots lack them.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(try_from = "serde_json::Value", into = "serde_json::Value")]
+pub struct SavedClient {
+    pub client: Client,
+    /// Process argv, split from the raw /proc/<pid>/cmdline
+    pub argv: Option<Vec<String>>,
+    /// Process working directory (recorded only; not used when loading)
+    pub cwd: Option<String>,
+}
+
+// The client fields and the extras share one JSON object. serde's flatten can't be
+// used for that: it buffers values and the crate's monitor id is an i128.
+impl From<SavedClient> for serde_json::Value {
+    fn from(saved: SavedClient) -> Self {
+        let mut value = serde_json::to_value(&saved.client).expect("Client serializes to JSON");
+        let object = value.as_object_mut().expect("Client serializes to an object");
+        if let Some(argv) = saved.argv {
+            object.insert("argv".to_string(), serde_json::json!(argv));
+        }
+        if let Some(cwd) = saved.cwd {
+            object.insert("cwd".to_string(), serde_json::json!(cwd));
+        }
+        value
+    }
+}
+
+impl TryFrom<serde_json::Value> for SavedClient {
+    type Error = serde_json::Error;
+
+    fn try_from(mut value: serde_json::Value) -> Result<Self, Self::Error> {
+        // Both extras are optional: snapshots from before they existed lack them
+        let (argv, cwd) = match value.as_object_mut() {
+            Some(object) => (
+                object.remove("argv").and_then(|v| serde_json::from_value(v).ok()),
+                object.remove("cwd").and_then(|v| serde_json::from_value(v).ok()),
+            ),
+            None => (None, None),
+        };
+        Ok(SavedClient { client: serde_json::from_value(value)?, argv, cwd })
+    }
+}
+
+impl SavedClient {
+    pub fn capture(client: &Client) -> Self {
+        SavedClient {
+            client: client.clone(),
+            argv: read_argv(client.pid),
+            cwd: read_cwd(client.pid),
+        }
+    }
+}
+
+/// Write a file by writing a sibling temp file then renaming it over the target,
+/// so an interrupted save never leaves a truncated snapshot behind
+fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Write both snapshot files for a session directory
+fn write_snapshot(base_dir: &std::path::Path, exec_lines: &[String], saved: &[SavedClient]) -> std::io::Result<()> {
+    let mut exec = String::new();
+    for line in exec_lines {
+        exec.push_str(line);
+        exec.push('\n');
+    }
+    write_atomic(&base_dir.join(EXEC_NAME), exec.as_bytes())?;
+    write_atomic(&base_dir.join(CLIENTS_PATH_NAME), &serde_json::to_vec(saved)?)
 }
 
 pub struct LocalSession {
@@ -170,16 +246,15 @@ impl Session for LocalSession {
 
         let client_info = Clients::get().expect("Unable to fetch clients");
 
-        let mut exec_file = File::create(base_dir.join(EXEC_NAME))
-            .expect("Failed to create session file");
-        let clients_file = File::create(base_dir.join(CLIENTS_PATH_NAME))
-            .expect("Failed to create clients file");
         let mut pids: Vec<i32> = vec![];
-        let mut saved_clients: Vec<Client> = vec![];
+        let mut saved_clients: Vec<SavedClient> = vec![];
+        let mut exec_lines: Vec<String> = vec![];
         let xdg_map: HashMap<String, String> = crate::command_faker::build_xdg_command_map();
 
         for info in client_info.iter().rev() {
-            saved_clients.push(info.clone());
+            // Every window is recorded in clients.json, whatever happens to its command
+            saved_clients.push(SavedClient::capture(info));
+            // exec.conf holds one launch line per distinct process
             if !self.save_duplicate_pids && pids.contains(&info.pid) {
                 continue;
             }
@@ -194,12 +269,11 @@ impl Session for LocalSession {
                 .map(|opt| opt(info))
                 .filter(|opt| !opt.is_empty())
                 .collect();
-            exec_file
-                .write_all(format!("[{}] {}\n", exec_opts.join(";"), cmd.unwrap()).as_bytes())?;
+            exec_lines.push(format!("[{}] {}", exec_opts.join(";"), cmd.unwrap()));
         }
 
-        serde_json::to_writer(&clients_file, &saved_clients)
-            .expect("Failed to write to clients file");
+        write_snapshot(&base_dir, &exec_lines, &saved_clients)
+            .expect("Failed to write session files");
         println!("Session saved");
         Ok(())
     }
@@ -323,6 +397,55 @@ pub mod test_support {
 mod tests {
     use super::*;
     use super::test_support::client;
+
+    #[test]
+    fn test_saved_client_round_trip_with_argv_and_cwd() {
+        let saved = SavedClient {
+            client: client("brave", "tab", 2, false, (0, 0), (10, 10)),
+            argv: Some(vec!["brave".into(), "--user-data-dir=/x y".into()]),
+            cwd: Some("/home/synthetic".into()),
+        };
+        let json = serde_json::to_string(&vec![saved.clone()]).unwrap();
+        let back: Vec<SavedClient> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back[0].argv, saved.argv);
+        assert_eq!(back[0].cwd, saved.cwd);
+        assert_eq!(back[0].client, saved.client);
+        // Still readable as a plain client list by older consumers
+        let plain: Vec<Client> = serde_json::from_str(&json).unwrap();
+        assert_eq!(plain[0], saved.client);
+    }
+
+    #[test]
+    fn test_old_snapshot_without_new_fields_still_reads() {
+        let old = serde_json::to_string(&vec![client("kitty", "t", 1, false, (1, 2), (3, 4))]).unwrap();
+        let back: Vec<SavedClient> = serde_json::from_str(&old).unwrap();
+        assert_eq!(back.len(), 1);
+        assert!(back[0].argv.is_none() && back[0].cwd.is_none());
+        // And absent fields are not written back out
+        assert!(!serde_json::to_string(&back).unwrap().contains("argv"));
+    }
+
+    #[test]
+    fn test_write_snapshot_is_atomic_and_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let clients: Vec<SavedClient> = (0..3)
+            .map(|i| SavedClient {
+                client: client("brave", &format!("w{i}"), 1, false, (i, 0), (10, 10)),
+                argv: Some(vec!["brave".into()]),
+                cwd: None,
+            })
+            .collect();
+        // Three windows of one process: one launch line, three saved windows
+        write_snapshot(dir.path(), &["[workspace 1 silent] brave".to_string()], &clients).unwrap();
+        let back: Vec<SavedClient> =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join(CLIENTS_PATH_NAME)).unwrap()).unwrap();
+        assert_eq!(back.len(), 3);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(EXEC_NAME)).unwrap(),
+            "[workspace 1 silent] brave\n"
+        );
+        assert!(!dir.path().join("exec.conf.tmp").exists());
+    }
 
     #[test]
     fn test_plan_adjustment_tiled_gets_workspace_only() {

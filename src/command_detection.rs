@@ -33,18 +33,60 @@ fn extract_binary_name(command: &str) -> String {
     format!("{} {}", binary, parts.skip(1).collect::<Vec<&str>>().join(" ")).trim().to_string()
 }
 
-fn handle_proc_cmdline(client: &Client) -> Result<String, std::io::Error> {
-    let cmdline_path = format!("/proc/{}/cmdline", client.pid);
-    if let Ok(cmdline) = fs::read_to_string(&cmdline_path) {
-        let cleaned: String = cmdline
-            .replace('\0', " ")
-            .trim()
-            .to_string();
-
-        Ok(extract_binary_name(&cleaned))
-    } else {
-        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Cmdline not found"))
+/// Split raw `/proc/<pid>/cmdline` bytes into argv (NUL separated, NUL terminated)
+pub fn parse_cmdline(raw: &[u8]) -> Vec<String> {
+    let raw = raw.strip_suffix(&[0]).unwrap_or(raw);
+    if raw.is_empty() {
+        return vec![];
     }
+    raw.split(|&b| b == 0)
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect()
+}
+
+/// The process argv, split on NUL before any name extraction
+pub fn read_argv(pid: i32) -> Option<Vec<String>> {
+    let raw = fs::read(format!("/proc/{}/cmdline", pid)).ok()?;
+    let argv = parse_cmdline(&raw);
+    if argv.is_empty() { None } else { Some(argv) }
+}
+
+/// The process working directory
+pub fn read_cwd(pid: i32) -> Option<String> {
+    fs::read_link(format!("/proc/{}/cwd", pid))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Quote one argument for a POSIX shell; arguments of safe characters stay bare
+pub fn shell_quote(arg: &str) -> String {
+    let safe = !arg.is_empty()
+        && arg.chars().all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+    if safe {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
+}
+
+/// Join argv into a shell command line, quoting where needed
+pub fn shell_join(argv: &[String]) -> String {
+    argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
+}
+
+/// Build a launch command from argv: the binary name (path dropped) then quoted arguments
+pub fn command_from_argv(argv: &[String]) -> Option<String> {
+    let first = argv.first()?;
+    let binary = first.rsplit('/').next().unwrap_or(first);
+    let mut parts = vec![binary.to_string()];
+    parts.extend(argv.iter().skip(1).cloned());
+    Some(shell_join(&parts))
+}
+
+fn handle_proc_cmdline(client: &Client) -> Result<String, std::io::Error> {
+    read_argv(client.pid)
+        .and_then(|argv| command_from_argv(&argv))
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Cmdline not found"))
 }
 
 fn handle_proc_exe(client: &Client) -> Result<String, std::io::Error> {
@@ -118,6 +160,48 @@ mod tests {
         assert_eq!(extract_binary_name("/nix/store/.firefox-wrapped"), ".firefox-wrapped");
     }
     
+    #[test]
+    fn test_parse_cmdline_splits_on_nul() {
+        assert_eq!(
+            parse_cmdline(b"omawrite\0Job search activity.md\0"),
+            vec!["omawrite".to_string(), "Job search activity.md".to_string()]
+        );
+        assert_eq!(parse_cmdline(b"a\0\0b\0"), vec!["a".to_string(), "".to_string(), "b".to_string()]);
+        assert!(parse_cmdline(b"").is_empty());
+    }
+
+    #[test]
+    fn test_argv_round_trips_through_shell_quoting() {
+        let argv: Vec<String> = ["/usr/bin/omawrite", "Job search activity.md", "it's", "a\"b", "plain-1.x", ""]
+            .iter().map(|s| s.to_string()).collect();
+        let cmd = command_from_argv(&argv).unwrap();
+        assert_eq!(cmd, r#"omawrite 'Job search activity.md' 'it'\''s' 'a"b' plain-1.x ''"#);
+
+        // The quoted command line parses back to the original argv under a real shell
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s\\0' {}", cmd.splitn(2, ' ').nth(1).unwrap()))
+            .output()
+            .unwrap();
+        assert_eq!(parse_cmdline(&out.stdout), argv[1..].to_vec());
+    }
+
+    #[test]
+    fn test_shell_quote() {
+        assert_eq!(shell_quote("simple"), "simple");
+        assert_eq!(shell_quote("--flag=/a/b"), "--flag=/a/b");
+        assert_eq!(shell_quote("two words"), "'two words'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn test_read_own_argv_and_cwd() {
+        let pid = std::process::id() as i32;
+        let argv = read_argv(pid).unwrap();
+        assert!(!argv.is_empty());
+        assert_eq!(read_cwd(pid).unwrap(), std::env::current_dir().unwrap().to_string_lossy());
+    }
+
     #[test]
     fn test_class_resolves_to_own_desktop_entry() {
         // Vesktop-style: class is the desktop file id, title is a stale webapp's name
