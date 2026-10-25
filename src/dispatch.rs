@@ -135,7 +135,7 @@ pub fn render_lua(op: &Op) -> String {
         ),
         Op::Pin { window } => format!("hl.dsp.window.pin({{ window = {} }})", lua_window(window)),
         Op::Fullscreen { window, maximized } => format!(
-            "hl.dsp.window.fullscreen({{ mode = '{}', action = 'enable', window = {} }})",
+            "hl.dsp.window.fullscreen({{ mode = '{}', action = 'set', window = {} }})",
             if *maximized { "maximized" } else { "fullscreen" },
             lua_window(window)
         ),
@@ -361,7 +361,7 @@ mod tests {
         );
         assert_eq!(
             render_lua(&Op::Fullscreen { window: addr(), maximized: false }),
-            "hl.dsp.window.fullscreen({ mode = 'fullscreen', action = 'enable', window = 'address:0xabc123' })"
+            "hl.dsp.window.fullscreen({ mode = 'fullscreen', action = 'set', window = 'address:0xabc123' })"
         );
         assert_eq!(
             render_lua(&Op::MoveWorkspaceToMonitor { workspace: 2, monitor: 1 }),
