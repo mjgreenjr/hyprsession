@@ -102,33 +102,57 @@ fn get_desktop_file_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// Prefix marking map keys derived from a desktop file id (filename stem), so
+/// that id lookups never shadow or get confused with name-keyed entries.
+const APP_ID_KEY_PREFIX: &str = "id:";
+
+/// Key under which an application's desktop file id is indexed in the xdg map
+pub fn xdg_id_key(app_id: &str) -> String {
+    format!("{}{}", APP_ID_KEY_PREFIX, app_id.to_lowercase())
+}
+
 /// Create a map between application names and their commands from XDG .desktop files
-/// Returns a HashMap where keys are application names and values are the commands to run them
+/// Returns a HashMap where keys are application names (lowercased) and values are the
+/// commands to run them. Each entry is also indexed by its desktop file id (filename
+/// stem, lowercased) under `xdg_id_key`.
 pub fn build_xdg_command_map() -> HashMap<String, String> {
+    build_xdg_command_map_from(&get_desktop_file_dirs())
+}
+
+/// As `build_xdg_command_map`, but reading from the given directories (highest priority first)
+pub fn build_xdg_command_map_from(dirs: &[PathBuf]) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    
-    for dir in get_desktop_file_dirs() {
+    let mut ids: Vec<(String, String)> = Vec::new();
+
+    for dir in dirs {
         if !dir.exists() {
             continue;
         }
-        
-        if let Ok(entries) = fs::read_dir(&dir) {
+
+        if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                
+
                 // Only process .desktop files
                 if path.extension().and_then(|s| s.to_str()) != Some("desktop") {
                     continue;
                 }
-                
+
                 if let Some((name, command)) = parse_desktop_file(&path) {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        ids.push((xdg_id_key(stem), command.clone()));
+                    }
                     // Only add if not already present (respects priority order)
                     map.entry(name).or_insert(command);
                 }
             }
         }
     }
-    
+
+    for (key, command) in ids {
+        map.entry(key).or_insert(command);
+    }
+
     map
 }
 
@@ -188,5 +212,35 @@ Icon=test-icon
         
         // Cleanup
         fs::remove_file(&test_file).unwrap();
+    }
+
+    #[test]
+    fn test_xdg_map_indexes_by_desktop_id() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("dev.vencord.Vesktop.desktop"),
+            "[Desktop Entry]\nName=Vesktop\nExec=vesktop-launcher %U\n",
+        ).unwrap();
+        // A stale entry whose Name collides with what the title step would look up
+        fs::write(
+            dir.path().join("discord-webapp.desktop"),
+            "[Desktop Entry]\nName=Discord\nExec=chromium --app=https://discord.com\n",
+        ).unwrap();
+
+        let map = build_xdg_command_map_from(&[dir.path().to_path_buf()]);
+        assert_eq!(map.get(&xdg_id_key("dev.vencord.vesktop")).map(String::as_str), Some("vesktop-launcher"));
+        assert_eq!(map.get("vesktop").map(String::as_str), Some("vesktop-launcher"));
+        assert_eq!(map.get("discord").map(String::as_str), Some("chromium --app=https://discord.com"));
+        // Id keys never appear as plain name keys
+        assert!(!map.contains_key("dev.vencord.vesktop"));
+    }
+
+    #[test]
+    fn test_xdg_name_keys_win_over_id_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.desktop"), "[Desktop Entry]\nName=b\nExec=one\n").unwrap();
+        let map = build_xdg_command_map_from(&[dir.path().to_path_buf()]);
+        assert_eq!(map.get("b").map(String::as_str), Some("one"));
+        assert_eq!(map.get(&xdg_id_key("A")).map(String::as_str), Some("one"));
     }
 }

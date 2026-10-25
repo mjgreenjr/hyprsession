@@ -4,6 +4,7 @@ use std::process::Command;
 use hyprland::data::{Client, Clients};
 use hyprland::shared::HyprData;
 use std::collections::HashMap;
+use crate::command_faker::xdg_id_key;
 
 /// Check if a command exists in PATH using 'which'
 pub fn command_exists_in_path(command: &str) -> bool {
@@ -60,20 +61,35 @@ fn handle_initial_class(client: &Client) -> Result<String, std::io::Error> {
     Ok(client.initial_class.to_lowercase())
 }
 
+/// Look up a window class as a desktop file id (e.g. `dev.vencord.vesktop`)
+fn resolve_class_by_app_id(class: &str, xdg_map: &HashMap<String, String>) -> Option<String> {
+    if class.is_empty() {
+        return None;
+    }
+    xdg_map.get(&xdg_id_key(class)).cloned()
+}
+
 fn handle_initial_title(client: &Client) -> Result<String, std::io::Error> {
     Ok(client.initial_title.to_lowercase())
 }
 
 /// Fetch command for a Hyprland client using multiple detection methods
 pub fn fetch_command(client: &Client, xdg_map: &HashMap<String, String>) -> Result<String, std::io::Error> {
-    let handlers = vec![
-        handle_proc_cmdline,
-        handle_proc_exe,
-        handle_initial_class,
-        handle_initial_title,
+    type Handler = fn(&Client) -> Result<String, std::io::Error>;
+    // (handler, whether the step also consults the desktop file id index)
+    let handlers: [(Handler, bool); 4] = [
+        (handle_proc_cmdline, false),
+        (handle_proc_exe, false),
+        (handle_initial_class, true),
+        (handle_initial_title, false),
     ];
 
-    for handler in handlers {
+    for (handler, by_app_id) in handlers {
+        if by_app_id {
+            if let Some(command) = resolve_class_by_app_id(&client.initial_class, xdg_map) {
+                return Ok(command);
+            }
+        }
         if let Ok(command) = handler(client) {
             if command_exists_in_path(&command) {
                 return Ok(command);
@@ -102,6 +118,20 @@ mod tests {
         assert_eq!(extract_binary_name("/nix/store/.firefox-wrapped"), ".firefox-wrapped");
     }
     
+    #[test]
+    fn test_class_resolves_to_own_desktop_entry() {
+        // Vesktop-style: class is the desktop file id, title is a stale webapp's name
+        let mut map = HashMap::new();
+        map.insert(xdg_id_key("dev.vencord.vesktop"), "vesktop".to_string());
+        map.insert("discord".to_string(), "chromium --app=https://discord.com".to_string());
+
+        assert_eq!(resolve_class_by_app_id("dev.vencord.Vesktop", &map), Some("vesktop".to_string()));
+        assert_eq!(resolve_class_by_app_id("unknown.app", &map), None);
+        assert_eq!(resolve_class_by_app_id("", &map), None);
+        // Name-keyed entries are not reachable through the class/id index
+        assert_eq!(resolve_class_by_app_id("discord", &map), None);
+    }
+
     /*
     #[test]
     fn test_handle_nix_wrapped() {
