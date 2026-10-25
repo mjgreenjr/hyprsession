@@ -350,3 +350,67 @@ mod cli_tests {
         assert!(stderr.contains("Save interval needs to be greater than 0"));
     }
 }
+mod load_safety {
+    use super::*;
+
+    /// A non-simulated session. Any failure below must happen before clear(), which
+    /// would need a running Hyprland, so these tests never touch a compositor.
+    fn live_session(path: &std::path::Path) -> LocalSession {
+        LocalSession {
+            base_path: path.to_str().unwrap().to_string(),
+            simulate: false,
+            load_time: 1,
+            adjust_clients_only: false,
+            save_duplicate_pids: false,
+            dialect: hyprsession::dispatch::Dialect::Lua,
+        }
+    }
+
+    #[test]
+    fn test_load_fails_before_clear_when_exec_conf_is_missing() {
+        let dir = TempDir::new().unwrap();
+        let err = live_session(dir.path()).load("").unwrap_err();
+        assert!(err.to_string().contains("exec.conf"), "{err}");
+    }
+
+    #[test]
+    fn test_load_fails_before_clear_when_exec_conf_is_unparseable() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("exec.conf"), "[monitor ;workspace silent;move size] x\n").unwrap();
+        let err = live_session(dir.path()).load("").unwrap_err();
+        assert!(err.to_string().contains("line 1"), "{err}");
+    }
+
+    #[test]
+    fn test_load_fails_before_clear_when_exec_conf_has_no_launch_lines() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("exec.conf"), "\n  \n").unwrap();
+        let err = live_session(dir.path()).load("").unwrap_err();
+        assert!(err.to_string().contains("no launch lines"), "{err}");
+    }
+
+    #[test]
+    fn test_load_fails_before_clear_when_clients_json_is_corrupt() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("exec.conf"), "[workspace 1 silent] true\n").unwrap();
+        std::fs::write(dir.path().join("clients.json"), "{not json").unwrap();
+        let err = live_session(dir.path()).load("").unwrap_err();
+        assert!(err.to_string().contains("clients.json"), "{err}");
+    }
+
+    #[test]
+    fn test_simulate_load_of_old_format_snapshot_succeeds_and_sends_nothing() {
+        let dir = TempDir::new().unwrap();
+        // Old format: per-process lines, no argv/cwd anywhere
+        std::fs::write(
+            dir.path().join("exec.conf"),
+            "[monitor 0;workspace 2 silent;float;move 10 20;size 300 200] kitty\n[monitor 0;workspace 1 silent;move 0 0] brave\n",
+        ).unwrap();
+        std::fs::write(dir.path().join("clients.json"), "[]").unwrap();
+        let mut session = live_session(dir.path());
+        session.simulate = true;
+        assert!(session.load("").is_ok());
+        // Nothing was written back
+        assert_eq!(std::fs::read_to_string(dir.path().join("clients.json")).unwrap(), "[]");
+    }
+}

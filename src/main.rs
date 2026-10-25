@@ -7,6 +7,7 @@ use clap::{Parser, ValueEnum};
 pub mod command_detection;
 pub mod command_faker;
 pub mod dispatch;
+pub mod load;
 pub mod legacy;
 pub mod session;
 

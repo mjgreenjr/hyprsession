@@ -58,7 +58,7 @@ Name of the session or command
 Command to run (see below) 
 
 ### -l, --load-time <load_time>
-The period of time after loading a session that windows are modified to match virtual counterparts
+How long, after the last program has been launched, windows keep being matched to their saved counterparts. Loading ends early once every saved window has been placed. Each program is given up to 20 seconds to show a window before the next is launched.
 
 ### -i, --save-interval <save_interval>
 This sets the interval in seconds between session saves. The default is 60 seconds.

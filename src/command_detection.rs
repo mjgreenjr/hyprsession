@@ -1,8 +1,7 @@
 //use regex::Regex;
 use std::fs;
 use std::process::Command;
-use hyprland::data::{Client, Clients};
-use hyprland::shared::HyprData;
+use hyprland::data::Client;
 use std::collections::HashMap;
 use crate::command_faker::xdg_id_key;
 
@@ -19,7 +18,8 @@ pub fn command_exists_in_path(command: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Extract the binary name from a command string
+/// Extract the binary name from a command string (kept for the argv-less test helpers)
+#[cfg(test)]
 fn extract_binary_name(command: &str) -> String {
     let parts = command.split_whitespace();
     let binary = parts

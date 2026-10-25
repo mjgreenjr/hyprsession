@@ -1,12 +1,9 @@
-use hyprland::data::{Client, Clients, FullscreenMode};
-use hyprland::event_listener::EventListener;
-use hyprland::prelude::*;
-use hyprland::shared::Address;
-use std::fs::File;
-use std::io::read_to_string;
+use hyprland::data::{Client, Clients, FullscreenMode, Workspace};
+use hyprland::shared::{HyprData, HyprDataActive};
 use crate::command_detection::{fetch_command, read_argv, read_cwd};
 use serde::{Deserialize, Serialize};
 use crate::dispatch::{Dialect, Dispatcher, Op, WorkspaceTarget};
+use crate::load::{desired_from_rules, launch_order, placeholder_client, parse_exec_conf, run_load, LoadPlan, RealHost};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -181,49 +178,67 @@ pub fn plan_adjustment(real_client: &Client, session_client: &Client) -> Vec<Op>
     ops
 }
 
-fn adjust_client(dispatcher: &Dispatcher, real_client: &Client, session_client: &Client) {
-    println!("found '{}' on workspace: {}", real_client.title, real_client.workspace.id);
-    for op in plan_adjustment(real_client, session_client) {
-        if dispatcher.send(&op).is_err() {
-            println!("Warning: Failed to apply {:?}: {}", op, real_client.title);
+impl LocalSession {
+    /// Read and validate a snapshot, returning what load will do
+    fn prepare_load(&self, base_dir: &std::path::Path) -> hyprland::Result<LoadPlan> {
+        let fail = |msg: String| hyprland::error::HyprError::Other(msg);
+
+        let saved: Vec<SavedClient> = match std::fs::read_to_string(base_dir.join(CLIENTS_PATH_NAME)) {
+            Ok(data) => serde_json::from_str(&data)
+                .map_err(|e| fail(format!("{} is not valid: {e}", CLIENTS_PATH_NAME)))?,
+            Err(_) => vec![],
+        };
+
+        let mut entries = vec![];
+        if !self.adjust_clients_only {
+            let exec_path = base_dir.join(EXEC_NAME);
+            let text = std::fs::read_to_string(&exec_path)
+                .map_err(|e| fail(format!("cannot read {}: {e}", exec_path.display())))?;
+            entries = parse_exec_conf(&text).map_err(fail)?;
+            if entries.is_empty() {
+                return Err(fail(format!("{} contains no launch lines", exec_path.display())));
+            }
+            for entry in entries.iter().filter(|e| !e.rules.unknown.is_empty()) {
+                println!("Warning: ignoring unknown rules {:?} for '{}'", entry.rules.unknown, entry.command);
+            }
         }
+
+        // New-format snapshots (argv recorded) place every saved window by class.
+        // Old ones only know their launch lines, so each launch's window is placed by
+        // that line's rules.
+        let new_format = saved.iter().any(|c| c.argv.is_some());
+        let place_by_class = self.adjust_clients_only || new_format;
+
+        Ok(LoadPlan {
+            entries: launch_order(entries),
+            saved: if place_by_class { saved.into_iter().map(|c| c.client).collect() } else { vec![] },
+            place_by_class,
+            tail_ticks: LoadPlan::tail_ticks_for(self.load_time),
+            restore_workspace: if self.simulate { None } else { Workspace::get_active().ok().map(|w| w.id) },
+        })
     }
 }
 
-fn process_window_event(dispatcher: &Dispatcher, address: Address, clients_data: &'static str, start_time: std::time::Instant, load_time: u64) {
-    let clients: Vec<Client> = serde_json::from_str(clients_data)
-        .expect("Failed to parse clients data");
-
-    if start_time.elapsed().as_secs() > load_time { 
-        println!("Load time exceeded, skipping client adjustments");
-        return;
+/// Print what a load would send. Windows to place do not exist yet, so their
+/// dispatches are shown against a placeholder address.
+fn simulate_load(dispatcher: &Dispatcher, plan: &LoadPlan) {
+    for entry in &plan.entries {
+        let _ = dispatcher.send(&Op::Exec(entry.command.clone()));
     }
-
-    let real_clients = Clients::get()
-        .expect("Unable to fetch clients");
-    if let Some(real_client) = real_clients.iter().find(|c| c.address == address) {
-        for session_client in clients.iter() {
-            if session_client.title == real_client.title {
-                println!("Adjusting client: {:?}", real_client.title);
-                adjust_client(dispatcher, real_client, session_client);
-                break;
-            } else {
-                println!("Client '{:?}' not found - skipping", address);
+    if plan.place_by_class {
+        for wanted in &plan.saved {
+            for op in plan_adjustment(&placeholder_client(), wanted) {
+                println!("Would send once the window exists: dispatch {}", dispatcher.render(&op));
+            }
+        }
+    } else {
+        for entry in &plan.entries {
+            let blank = placeholder_client();
+            for op in plan_adjustment(&blank, &desired_from_rules(&blank, &entry.rules)) {
+                println!("Would send once the window exists: dispatch {}", dispatcher.render(&op));
             }
         }
     }
-}
-
-fn load_programs(dispatcher: &Dispatcher, base_path: &PathBuf) -> hyprland::Result<()> {
-    let session_file = File::open(base_path.join(EXEC_NAME));
-
-    if session_file.is_ok() {
-        for line in read_to_string(session_file.unwrap()).unwrap().lines() {
-            dispatcher.send(&Op::Exec(line.to_string()))?;
-        }
-    }
-
-    Ok(())
 }
 
 impl Session for LocalSession {
@@ -281,37 +296,23 @@ impl Session for LocalSession {
     fn load(&self, name: &str) -> hyprland::Result<()> {
         println!("Loading session: {}", name);
         let base_dir: PathBuf = to_base_dir!(self.base_path.clone(), name.to_string());
-        let start_time = std::time::Instant::now();
+        let dispatcher = Dispatcher::new(self.dialect, self.simulate);
 
-        if !self.adjust_clients_only {
-            self.clear()?;
-            load_programs(&Dispatcher::new(self.dialect, self.simulate), &base_dir.clone())?;
+        // Everything is read and checked before anything is touched: a bad snapshot
+        // must fail here, not after clear() has killed the desktop
+        let plan = self.prepare_load(&base_dir)?;
+
+        if self.simulate {
+            simulate_load(&dispatcher, &plan);
+        } else {
+            if !self.adjust_clients_only {
+                self.clear()?;
+            }
+            let host = RealHost { dispatcher };
+            let report = run_load(&host, &plan);
+            println!("Placed {} windows, {} saved windows not matched", report.placed, report.unmatched.len());
         }
 
-        // Clone the values we need inside the thread before moving into the closure
-        let load_time = self.load_time;
-        let dispatcher = Dispatcher::new(self.dialect, self.simulate);
-        
-        std::thread::spawn(move || {
-            let clients_file_path = base_dir.join(CLIENTS_PATH_NAME);
-            let clients_data = std::fs::read_to_string(&clients_file_path)
-                .unwrap_or_else(|_| "[]".to_string());
-            let clients_data: &'static str = Box::leak(clients_data.into_boxed_str());
-
-            let mut event_listener = EventListener::new();
-            let title_dispatcher = dispatcher.clone();
-            event_listener.add_window_title_changed_handler({move |event| {
-                println!("Window title changed: {}", event.address);
-                process_window_event(&title_dispatcher, event.address, clients_data, start_time, load_time);
-            }});
-            event_listener.add_window_opened_handler({move |event| {
-                println!("Window opened: {}", event.window_address);
-                process_window_event(&dispatcher, event.window_address, clients_data, start_time, load_time);
-            }});
-            let _ = event_listener.start_listener();
-        });
-
-        std::thread::sleep(std::time::Duration::from_secs(self.load_time + 1));
         println!("Finished loading session");
         Ok(())
     }
