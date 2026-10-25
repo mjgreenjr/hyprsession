@@ -3,7 +3,7 @@ use hyprland::shared::{HyprData, HyprDataActive};
 use crate::command_detection::{fetch_command, read_argv, read_cwd};
 use serde::{Deserialize, Serialize};
 use crate::dispatch::{Dialect, Dispatcher, Op, WorkspaceTarget};
-use crate::load::{desired_from_rules, launch_order, placeholder_client, parse_exec_conf, run_load, LoadPlan, RealHost};
+use crate::load::{desired_from_rules, launch_order, placeholder_client, parse_exec_conf, run_load, clear_session, ClearConfig, LoadPlan, RealHost};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -337,23 +337,9 @@ impl Session for LocalSession {
 
     fn clear(&self) -> hyprland::Result<()> {
         if !self.simulate {
-            let pids: Vec<i32> = Clients::get()?
-                .iter()
-                .map(|c| c.pid)
-                .collect();
-            for pid in pids {
-                let _ = std::process::Command::new("kill")
-                    .arg(pid.to_string())
-                    .output()
-                    .unwrap();
-            }
-
-            loop {
-                if Clients::get()?.iter().collect::<Vec<&Client>>().is_empty() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
+            let host = RealHost { dispatcher: Dispatcher::new(self.dialect, false) };
+            clear_session(&host, &ClearConfig::default())
+                .map_err(hyprland::error::HyprError::Other)?;
         }
 
         println!("Cleared existing session");

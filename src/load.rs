@@ -278,8 +278,16 @@ pub trait Host {
     fn clients(&self) -> hyprland::Result<Vec<Client>>;
     fn send(&self, op: &Op) -> hyprland::Result<()>;
     fn active_workspace(&self) -> Option<i32>;
+    /// Signal a process
+    fn signal(&self, pid: i32, signal: Signal);
     /// Wait one poll interval
     fn pause(&self);
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Signal {
+    Term,
+    Kill,
 }
 
 pub struct RealHost {
@@ -299,9 +307,135 @@ impl Host for RealHost {
         Workspace::get_active().ok().map(|w| w.id)
     }
 
+    fn signal(&self, pid: i32, signal: Signal) {
+        let flag = match signal {
+            Signal::Term => "-TERM",
+            Signal::Kill => "-KILL",
+        };
+        let _ = std::process::Command::new("kill").arg(flag).arg(pid.to_string()).output();
+    }
+
     fn pause(&self) {
         std::thread::sleep(std::time::Duration::from_millis(1000 / TICKS_PER_SECOND));
     }
+}
+
+/// How long each stage of clearing waits before escalating
+pub struct ClearConfig {
+    pub close_ticks: u64,
+    pub term_ticks: u64,
+    pub kill_ticks: u64,
+}
+
+impl Default for ClearConfig {
+    fn default() -> Self {
+        ClearConfig {
+            close_ticks: 15 * TICKS_PER_SECOND,
+            term_ticks: 10 * TICKS_PER_SECOND,
+            kill_ticks: 5 * TICKS_PER_SECOND,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ClearReport {
+    /// Titles of windows that went away after a graceful close
+    pub closed: Vec<String>,
+    pub termed: Vec<i32>,
+    pub killed: Vec<i32>,
+}
+
+fn describe(clients: &[Client]) -> String {
+    clients
+        .iter()
+        .map(|c| format!("'{}' ({}, pid {})", c.title, c.class, c.pid))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Poll until no clients remain or the ticks run out; returns what is left
+fn wait_for_empty(host: &dyn Host, ticks: u64) -> Result<Vec<Client>, String> {
+    let mut last = None;
+    for _ in 0..=ticks {
+        if let Ok(live) = host.clients() {
+            if live.is_empty() {
+                return Ok(live);
+            }
+            last = Some(live);
+        }
+        if last.is_some() || ticks > 0 {
+            host.pause();
+        }
+    }
+    last.ok_or_else(|| "cannot read the client list from Hyprland".to_string())
+}
+
+/// Pids worth signalling: distinct, and never init or the kernel
+fn signal_targets(clients: &[Client]) -> Vec<i32> {
+    let mut pids: Vec<i32> = vec![];
+    for c in clients {
+        if c.pid > 1 && !pids.contains(&c.pid) {
+            pids.push(c.pid);
+        }
+    }
+    pids
+}
+
+/// Close every window, escalating only for what stays: graceful close, then SIGTERM,
+/// then SIGKILL, each followed by a bounded wait. Fails, naming the survivors, if
+/// anything outlives SIGKILL.
+pub fn clear_session(host: &dyn Host, config: &ClearConfig) -> Result<ClearReport, String> {
+    let mut report = ClearReport::default();
+    let initial = host.clients().map_err(|e| format!("cannot read the client list: {e}"))?;
+    if initial.is_empty() {
+        return Ok(report);
+    }
+
+    println!("Closing {} windows gracefully", initial.len());
+    for client in &initial {
+        if host.send(&Op::Close(client.address.clone())).is_err() {
+            println!("Warning: close request failed for '{}'", client.title);
+        }
+    }
+    let mut left = wait_for_empty(host, config.close_ticks)?;
+    let still_open: HashSet<&Address> = left.iter().map(|c| &c.address).collect();
+    report.closed = initial
+        .iter()
+        .filter(|c| !still_open.contains(&c.address))
+        .map(|c| c.title.clone())
+        .collect();
+    println!("Closed gracefully: {}", report.closed.len());
+    for title in &report.closed {
+        println!("  closed '{title}'");
+    }
+    if left.is_empty() {
+        return Ok(report);
+    }
+
+    let pids = signal_targets(&left);
+    println!("Still open after graceful close: {}", describe(&left));
+    println!("Sending SIGTERM to pids {pids:?}");
+    pids.iter().for_each(|&pid| host.signal(pid, Signal::Term));
+    report.termed = pids;
+    left = wait_for_empty(host, config.term_ticks)?;
+    if left.is_empty() {
+        return Ok(report);
+    }
+
+    let pids = signal_targets(&left);
+    println!("Still open after SIGTERM: {}", describe(&left));
+    println!("Sending SIGKILL to pids {pids:?}");
+    pids.iter().for_each(|&pid| host.signal(pid, Signal::Kill));
+    report.killed = pids;
+    left = wait_for_empty(host, config.kill_ticks)?;
+    if left.is_empty() {
+        return Ok(report);
+    }
+
+    Err(format!(
+        "could not clear the desktop; these windows survived SIGKILL: {}",
+        describe(&left)
+    ))
 }
 
 fn apply(host: &dyn Host, live: &Client, wanted: &Client) {
@@ -481,6 +615,9 @@ mod tests {
         scripts: RefCell<std::collections::VecDeque<Vec<(u64, Client)>>>,
         sent: RefCell<Vec<Op>>,
         pauses: Cell<u64>,
+        signals: RefCell<Vec<(i32, Signal)>>,
+        /// pid -> how much it takes to remove its windows: 0 close, 1 SIGTERM, 2 SIGKILL, 3 never
+        resist: RefCell<std::collections::HashMap<i32, u8>>,
     }
 
     impl FakeHost {
@@ -491,6 +628,8 @@ mod tests {
                 scripts: RefCell::new(scripts.into()),
                 sent: RefCell::new(vec![]),
                 pauses: Cell::new(0),
+                signals: RefCell::new(vec![]),
+                resist: RefCell::new(Default::default()),
             }
         }
     }
@@ -505,8 +644,22 @@ mod tests {
                     self.windows.borrow_mut().push((self.tick.get() + delay, c));
                 }
             }
+            if let Op::Close(addr) = op {
+                let resist = self.resist.borrow().clone();
+                self.windows.borrow_mut().retain(|(_, c)| {
+                    !(c.address == *addr && resist.get(&c.pid).copied().unwrap_or(0) == 0)
+                });
+            }
             self.sent.borrow_mut().push(op.clone());
             Ok(())
+        }
+        fn signal(&self, pid: i32, signal: Signal) {
+            self.signals.borrow_mut().push((pid, signal));
+            let needed = match signal { Signal::Term => 1, Signal::Kill => 2 };
+            let resist = self.resist.borrow().get(&pid).copied().unwrap_or(0);
+            if resist <= needed {
+                self.windows.borrow_mut().retain(|(_, c)| c.pid != pid);
+            }
         }
         fn active_workspace(&self) -> Option<i32> { Some(1) }
         fn pause(&self) {
@@ -618,5 +771,86 @@ mod tests {
         let report = run_load(&host, &plan);
         assert_eq!(report.placed, 0);
         assert_eq!(host.pauses.get(), LAUNCH_WAIT_TICKS);
+    }
+
+    fn desktop(pids: &[(i32, &str)]) -> Vec<Client> {
+        pids.iter()
+            .enumerate()
+            .map(|(i, (pid, class))| {
+                let mut c = client(class, &format!("{class} {i}"), 1, false, (i as i16, 0), (1, 1));
+                c.pid = *pid;
+                c
+            })
+            .collect()
+    }
+
+    const FAST: ClearConfig = ClearConfig { close_ticks: 3, term_ticks: 3, kill_ticks: 3 };
+
+    #[test]
+    fn test_clear_on_empty_desktop_does_nothing() {
+        let host = FakeHost::new(vec![], vec![]);
+        let report = clear_session(&host, &FAST).unwrap();
+        assert!(host.sent.borrow().is_empty() && host.signals.borrow().is_empty());
+        assert!(report.closed.is_empty());
+    }
+
+    #[test]
+    fn test_clear_closes_gracefully_without_any_signal() {
+        let host = FakeHost::new(desktop(&[(10, "brave"), (20, "kitty"), (10, "brave")]), vec![]);
+        let report = clear_session(&host, &FAST).unwrap();
+        assert_eq!(report.closed.len(), 3);
+        assert!(report.termed.is_empty() && report.killed.is_empty());
+        assert!(host.signals.borrow().is_empty());
+        let closes = host.sent.borrow().iter().filter(|o| matches!(o, Op::Close(_))).count();
+        assert_eq!(closes, 3);
+    }
+
+    #[test]
+    fn test_clear_escalates_only_for_what_stays() {
+        // kitty closes; spotify ignores close but not SIGTERM; stubborn needs SIGKILL
+        let host = FakeHost::new(desktop(&[(20, "kitty"), (30, "spotify"), (30, "spotify"), (40, "stubborn")]), vec![]);
+        host.resist.borrow_mut().insert(30, 1);
+        host.resist.borrow_mut().insert(40, 2);
+        let report = clear_session(&host, &FAST).unwrap();
+        assert_eq!(report.closed.len(), 1);
+        // The two spotify windows share a pid: one SIGTERM, covering both stragglers
+        // from the close stage; the pid that was already gone is never signalled
+        assert_eq!(report.termed, vec![30, 40]);
+        assert_eq!(report.killed, vec![40]);
+        assert_eq!(
+            *host.signals.borrow(),
+            vec![(30, Signal::Term), (40, Signal::Term), (40, Signal::Kill)]
+        );
+        // Each wait was bounded by its stage
+        assert!(host.pauses.get() <= FAST.close_ticks + FAST.term_ticks + FAST.kill_ticks + 3);
+    }
+
+    #[test]
+    fn test_clear_escalates_in_order_close_then_term_then_kill() {
+        let host = FakeHost::new(desktop(&[(50, "stubborn")]), vec![]);
+        host.resist.borrow_mut().insert(50, 2);
+        clear_session(&host, &FAST).unwrap();
+        // The close request went out before any signal
+        assert!(matches!(host.sent.borrow().first(), Some(Op::Close(_))));
+        assert_eq!(*host.signals.borrow(), vec![(50, Signal::Term), (50, Signal::Kill)]);
+    }
+
+    #[test]
+    fn test_clear_aborts_naming_survivors_of_sigkill() {
+        let host = FakeHost::new(desktop(&[(60, "zombie"), (70, "kitty")]), vec![]);
+        host.resist.borrow_mut().insert(60, 3);
+        let err = clear_session(&host, &FAST).unwrap_err();
+        assert!(err.contains("zombie") && err.contains("pid 60"), "{err}");
+        assert!(!err.contains("kitty"), "{err}");
+        assert_eq!(host.signals.borrow().last(), Some(&(60, Signal::Kill)));
+    }
+
+    #[test]
+    fn test_clear_never_signals_init() {
+        let host = FakeHost::new(desktop(&[(1, "odd"), (0, "odd")]), vec![]);
+        host.resist.borrow_mut().insert(1, 3);
+        host.resist.borrow_mut().insert(0, 3);
+        assert!(clear_session(&host, &FAST).is_err());
+        assert!(host.signals.borrow().is_empty());
     }
 }

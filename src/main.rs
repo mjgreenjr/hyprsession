@@ -112,8 +112,8 @@ fn main() -> hyprland::Result<()> {
         exit(1);
     }
 
-    // Only loading dispatches anything, so only it needs a resolved dialect
-    let dialect = if matches!(args.mode, Mode::Default | Mode::Load) {
+    // Loading and clearing dispatch to Hyprland, so only they need a resolved dialect
+    let dialect = if matches!(args.mode, Mode::Default | Mode::Load | Mode::Clear) {
         let (dialect, source) = resolve_dialect(args.dialect, args.simulate).unwrap_or_else(|e| {
             eprintln!("Error: {e}");
             exit(1);
