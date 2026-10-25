@@ -66,6 +66,12 @@ This sets the interval in seconds between session saves. The default is 60 secon
 ### --simulate
 Only simulate loading and clearing of sessions
 
+### --dialect <dialect>
+Selects how dispatches are sent to Hyprland: `auto` (default), `lua` or `classic`.
+`auto` probes the running compositor (under `--simulate` it guesses from the config files instead
+and sends nothing). Use `lua` for Hyprland builds using the Lua config provider.
+The dialect in use is printed when a session is loaded.
+
 ### --adjust-clients-only
 When loading a session this tell Hyprsession to not clear the current session and restart programs. 
 Instead it moves the existing clients to match the saved session.

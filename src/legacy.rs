@@ -54,12 +54,20 @@ pub fn main() -> hyprland::Result<()> {
     let save_interval = args.save_interval;
     let default_path = env::var("HOME").unwrap() + "/.local/share/hyprsession";
     let session_path = args.session_path.unwrap_or(default_path);
+    let (dialect, source) = crate::dispatch::resolve_dialect(crate::dispatch::DialectChoice::Auto, args.simulate)
+        .unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            exit(1);
+        });
+    println!("Dispatch dialect: {dialect} ({source})");
+
     let sessions = LocalSession {
         base_path: session_path.clone(),
         adjust_clients_only: false,
         load_time: 30,
         simulate: args.simulate,
         save_duplicate_pids: args.save_duplicate_pids,
+        dialect,
     };
 
     if args.save_interval == 0 {

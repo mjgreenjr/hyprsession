@@ -1,11 +1,11 @@
 use hyprland::data::{Client, Clients, FullscreenMode};
-use hyprland::{dispatch, dispatch::* };
 use hyprland::event_listener::EventListener;
 use hyprland::prelude::*;
 use hyprland::shared::Address;
 use std::fs::File;
 use std::io::{read_to_string, Write};
 use crate::command_detection::fetch_command;
+use crate::dispatch::{Dialect, Dispatcher, Op, WorkspaceTarget};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -44,122 +44,77 @@ pub struct LocalSession {
     pub simulate: bool,
     pub load_time:  u64, 
     pub adjust_clients_only: bool,
-    pub save_duplicate_pids: bool
+    pub save_duplicate_pids: bool,
+    pub dialect: Dialect,
 }
 
-struct ClientAdjustmentContext<'a> {
-    real_client: &'a Client,
-    session_client: &'a Client,
-    simulate: bool,
-}
+/// Work out which dispatches bring a live window in line with its saved client
+pub fn plan_adjustment(real_client: &Client, session_client: &Client) -> Vec<Op> {
+    let window = real_client.address.clone();
+    let mut ops = vec![];
 
-trait CheckAndAdjust {
-    fn check<T: PartialEq>(&self, param: fn(&Client) -> T) -> bool;
-    fn check_and_adjust<T: PartialEq>(&self, param: fn(&Client) -> T,  action: impl Fn() -> hyprland::Result<()>, msg: &str, fail_msg: &str);
-    fn warning(&self, msg: &str);
-}
-
-
-impl CheckAndAdjust for ClientAdjustmentContext<'_> {
-    fn check<T: PartialEq>(&self, param: fn(&Client) -> T) -> bool {
-        param(self.real_client) != param(self.session_client)
-    }
-
-    fn check_and_adjust<T: PartialEq>(&self, param: fn(&Client) -> T,  action: impl Fn() -> hyprland::Result<()>, msg: &str, fail_msg: &str) {
-        if self.check(param) {
-            println!("{}", msg);
-            if !self.simulate {
-                action().unwrap_or_else(|_| {
-                    self.warning(fail_msg);
-                });
-            }
+    // Anonymous special workspace (id -99) has no documented Lua form: deferred
+    let anonymous_special = session_client.workspace.id == -99;
+    if anonymous_special {
+        println!(
+            "Warning: skipping workspace placement of '{}': anonymous special workspaces are not supported",
+            real_client.title
+        );
+    } else {
+        if real_client.workspace.id != session_client.workspace.id {
+            let workspace = match session_client.workspace.name.strip_prefix("special:") {
+                Some(name) => WorkspaceTarget::Special(name.to_string()),
+                None => WorkspaceTarget::Id(session_client.workspace.id),
+            };
+            ops.push(Op::MoveToWorkspace { window: window.clone(), workspace });
+        }
+        if real_client.monitor != session_client.monitor && session_client.workspace.id > 0 {
+            ops.push(Op::MoveWorkspaceToMonitor {
+                workspace: session_client.workspace.id,
+                monitor: session_client.monitor.unwrap_or(0),
+            });
         }
     }
-
-    fn warning(&self, msg: &str) {
-        println!("Warning: {}: {}", msg, self.real_client.title);
+    if real_client.floating != session_client.floating {
+        ops.push(Op::Float { window: window.clone(), enable: session_client.floating });
     }
+    if real_client.pinned != session_client.pinned {
+        ops.push(Op::Pin { window: window.clone() });
+    }
+    if real_client.fullscreen != session_client.fullscreen
+        && session_client.fullscreen != FullscreenMode::None
+    {
+        ops.push(Op::Fullscreen {
+            window: window.clone(),
+            maximized: session_client.fullscreen == FullscreenMode::Maximized,
+        });
+    }
+    // Tiled windows take their geometry from the layout: only floating ones are placed
+    if session_client.floating && session_client.fullscreen == FullscreenMode::None {
+        ops.push(Op::MoveWindow {
+            window: window.clone(),
+            x: session_client.at.0,
+            y: session_client.at.1,
+        });
+        ops.push(Op::ResizeWindow {
+            window,
+            w: session_client.size.0,
+            h: session_client.size.1,
+        });
+    }
+    ops
 }
 
-fn adjust_client(real_client: &Client, session_client: &Client, simulate: bool) {
-    let context = ClientAdjustmentContext {
-        real_client: real_client,
-        session_client: session_client,
-        simulate,
-    };
-
-    let client_addr = WindowIdentifier::Address(context.real_client.address.clone());
+fn adjust_client(dispatcher: &Dispatcher, real_client: &Client, session_client: &Client) {
     println!("found '{}' on workspace: {}", real_client.title, real_client.workspace.id);
-    println!("adjusting '{}' to workspace: {}", real_client.title, session_client.workspace.id);
-    context.check_and_adjust(
-        |c| c.workspace.id,
-        || dispatch!(
-            MoveToWorkspaceSilent, 
-            WorkspaceIdentifierWithSpecial::Id(session_client.workspace.id),
-            Some(client_addr.clone())
-        ), 
-        format!("Moving {} to workspace {}", real_client.title, session_client.workspace.id).as_str(),
-        format!("Failed to move client to workspace {}", real_client.title).as_str()
-    );
-    context.check_and_adjust(
-        |c| c.monitor.unwrap_or(0),
-        || dispatch!(
-            MoveWorkspaceToMonitor, 
-            WorkspaceIdentifier::Id(session_client.workspace.id), 
-            MonitorIdentifier::Id(session_client.monitor.unwrap_or(0))
-        ), 
-        format!("Moving {} to monitor {}", real_client.title, session_client.monitor.unwrap_or(0)).as_str(),
-        format!("Failed to move client to monitor {}", real_client.title).as_str()
-    );
-    context.check_and_adjust(
-        |c| c.floating,
-        || dispatch!(ToggleFloating, Some(client_addr.clone())),
-        format!("Toggling floating for client {}", real_client.title).as_str(),
-        format!("Failed to toggle floating for client {}", real_client.title).as_str()
-    );
-    context.check_and_adjust(
-        |c| c.pinned,
-        || dispatch!(TogglePinWindow, client_addr.clone()),
-        format!("Pinning client window {}", real_client.title).as_str(),
-        format!("Failed to pin client window {}", real_client.title).as_str()
-    );
-    context.check_and_adjust(
-        |c| c.fullscreen,
-        || {        
-            dispatch!(FocusWindow, client_addr.clone()).unwrap_or_else(|_| {
-                println!("Warning: Failed to focus client window: {}", real_client.title);
-            });
-            dispatch!(
-                ToggleFullscreen,
-                if session_client.fullscreen == FullscreenMode::Maximized { FullscreenType::Maximize } else { FullscreenType::Real }
-            )
-        },
-        format!("Toggling fullscreen for client {}", real_client.title).as_str(),
-        format!("Failed to toggle fullscreen for client {}", real_client.title).as_str()
-    );
-
-    if session_client.fullscreen == FullscreenMode::None {
-        println!("Moving client: {}", real_client.title);
-        if !context.simulate {
-            hyprland::dispatch!(
-                MoveWindowPixel,
-                Position::Exact(session_client.at.0, session_client.at.1),
-                WindowIdentifier::Address(real_client.address.clone())
-            ).unwrap_or_else(|_| {
-                println!("Warning: Failed to move client window: {:?}", real_client.title);
-            });
+    for op in plan_adjustment(real_client, session_client) {
+        if dispatcher.send(&op).is_err() {
+            println!("Warning: Failed to apply {:?}: {}", op, real_client.title);
         }
-            // hyprland::dispatch!(
-        //     ResizeWindowPixel,
-        //     Position::Exact(session_client.size.0, session_client.size.1),
-        //     WindowIdentifier::Address(real_client.address.clone())
-        // ).unwrap_or_else(|_| {
-        //     println!("Warning: Failed to resize client window: {:?}", real_client.title);
-        // });
     }
 }
 
-fn process_window_event(address: Address, clients_data: &'static str, start_time: std::time::Instant, load_time: u64, simulate: bool) {
+fn process_window_event(dispatcher: &Dispatcher, address: Address, clients_data: &'static str, start_time: std::time::Instant, load_time: u64) {
     let clients: Vec<Client> = serde_json::from_str(clients_data)
         .expect("Failed to parse clients data");
 
@@ -174,7 +129,7 @@ fn process_window_event(address: Address, clients_data: &'static str, start_time
         for session_client in clients.iter() {
             if session_client.title == real_client.title {
                 println!("Adjusting client: {:?}", real_client.title);
-                adjust_client(real_client, session_client, simulate);
+                adjust_client(dispatcher, real_client, session_client);
                 break;
             } else {
                 println!("Client '{:?}' not found - skipping", address);
@@ -183,15 +138,12 @@ fn process_window_event(address: Address, clients_data: &'static str, start_time
     }
 }
 
-fn load_programs(base_path: &PathBuf, simulate: bool) -> hyprland::Result<()> {
+fn load_programs(dispatcher: &Dispatcher, base_path: &PathBuf) -> hyprland::Result<()> {
     let session_file = File::open(base_path.join(EXEC_NAME));
 
     if session_file.is_ok() {
         for line in read_to_string(session_file.unwrap()).unwrap().lines() {
-            if !simulate {
-                hyprland::dispatch!(Exec, line)?;
-            }
-            println!("Sending: dispatch exec {line}");
+            dispatcher.send(&Op::Exec(line.to_string()))?;
         }
     }
 
@@ -259,12 +211,12 @@ impl Session for LocalSession {
 
         if !self.adjust_clients_only {
             self.clear()?;
-            load_programs(&base_dir.clone(), self.simulate)?;
+            load_programs(&Dispatcher::new(self.dialect, self.simulate), &base_dir.clone())?;
         }
 
         // Clone the values we need inside the thread before moving into the closure
         let load_time = self.load_time;
-        let simulate = self.simulate;
+        let dispatcher = Dispatcher::new(self.dialect, self.simulate);
         
         std::thread::spawn(move || {
             let clients_file_path = base_dir.join(CLIENTS_PATH_NAME);
@@ -273,13 +225,14 @@ impl Session for LocalSession {
             let clients_data: &'static str = Box::leak(clients_data.into_boxed_str());
 
             let mut event_listener = EventListener::new();
+            let title_dispatcher = dispatcher.clone();
             event_listener.add_window_title_changed_handler({move |event| {
                 println!("Window title changed: {}", event.address);
-                process_window_event(event.address, clients_data, start_time, load_time, simulate);
+                process_window_event(&title_dispatcher, event.address, clients_data, start_time, load_time);
             }});
             event_listener.add_window_opened_handler({move |event| {
                 println!("Window opened: {}", event.window_address);
-                process_window_event(event.window_address, clients_data, start_time, load_time, simulate);
+                process_window_event(&dispatcher, event.window_address, clients_data, start_time, load_time);
             }});
             let _ = event_listener.start_listener();
         });
@@ -334,5 +287,87 @@ impl Session for LocalSession {
         } else {
             println!("Failed to delete session: {}", name);
         }
+    }
+}
+#[cfg(test)]
+pub mod test_support {
+    use hyprland::data::Client;
+
+    /// Build a synthetic client; only the fields sessions care about are parameters
+    pub fn client(class: &str, title: &str, ws: i32, floating: bool, at: (i16, i16), size: (i16, i16)) -> Client {
+        serde_json::from_value(serde_json::json!({
+            "address": format!("0x{:x}", (class.len() * 1000 + title.len() * 7 + at.0 as usize) as u32),
+            "at": [at.0, at.1],
+            "size": [size.0, size.1],
+            "workspace": { "id": ws, "name": ws.to_string() },
+            "floating": floating,
+            "fullscreen": 0,
+            "fullscreenClient": 0,
+            "monitor": 0,
+            "initialClass": class,
+            "class": class,
+            "initialTitle": title,
+            "title": title,
+            "pid": 100,
+            "xwayland": false,
+            "pinned": false,
+            "grouped": [],
+            "mapped": true,
+            "swallowing": null,
+            "focusHistoryID": 0
+        })).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::test_support::client;
+
+    #[test]
+    fn test_plan_adjustment_tiled_gets_workspace_only() {
+        let real = client("kitty", "term", 1, false, (0, 0), (500, 500));
+        let saved = client("kitty", "term", 4, false, (10, 20), (300, 300));
+        let ops = plan_adjustment(&real, &saved);
+        assert_eq!(ops, vec![Op::MoveToWorkspace {
+            window: real.address.clone(),
+            workspace: WorkspaceTarget::Id(4),
+        }]);
+    }
+
+    #[test]
+    fn test_plan_adjustment_floating_gets_float_move_resize() {
+        let real = client("mpv", "video", 1, false, (0, 0), (500, 500));
+        let saved = client("mpv", "video", 2, true, (10, 20), (300, 400));
+        let ops = plan_adjustment(&real, &saved);
+        let a = real.address.clone();
+        assert_eq!(ops, vec![
+            Op::MoveToWorkspace { window: a.clone(), workspace: WorkspaceTarget::Id(2) },
+            Op::Float { window: a.clone(), enable: true },
+            Op::MoveWindow { window: a.clone(), x: 10, y: 20 },
+            Op::ResizeWindow { window: a, w: 300, h: 400 },
+        ]);
+    }
+
+    #[test]
+    fn test_plan_adjustment_nothing_to_do_when_tiled_and_in_place() {
+        let real = client("kitty", "term", 3, false, (0, 0), (500, 500));
+        let saved = client("kitty", "term", 3, false, (5, 5), (100, 100));
+        assert!(plan_adjustment(&real, &saved).is_empty());
+    }
+
+    #[test]
+    fn test_plan_adjustment_named_and_anonymous_special_workspaces() {
+        let real = client("a", "t", 1, false, (0, 0), (1, 1));
+        let mut saved = client("a", "t", -98, false, (0, 0), (1, 1));
+        saved.workspace.name = "special:scratch".to_string();
+        assert_eq!(plan_adjustment(&real, &saved), vec![Op::MoveToWorkspace {
+            window: real.address.clone(),
+            workspace: WorkspaceTarget::Special("scratch".to_string()),
+        }]);
+
+        let mut anon = client("a", "t", -99, false, (0, 0), (1, 1));
+        anon.workspace.name = "special".to_string();
+        assert!(plan_adjustment(&real, &anon).is_empty());
     }
 }

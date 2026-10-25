@@ -16,6 +16,7 @@ fn test_load_session_with_nonexistent_file() {
         load_time: 1, // Reduced load time for faster tests
         adjust_clients_only: false,
         save_duplicate_pids: false,
+        dialect: hyprsession::dispatch::Dialect::Classic,
     };
 
     // This should not panic or fail when the session file doesn't exist
@@ -38,6 +39,7 @@ fn test_load_session_with_empty_file() {
         load_time: 1, // Reduced load time for faster tests
         adjust_clients_only: false,
         save_duplicate_pids: false,
+        dialect: hyprsession::dispatch::Dialect::Classic,
     };
 
     // This should handle empty files gracefully
@@ -70,6 +72,7 @@ fn test_load_session_with_sample_data() {
         load_time: 1, // Reduced from 30 to 1 for faster tests
         adjust_clients_only: false,
         save_duplicate_pids: false,
+        dialect: hyprsession::dispatch::Dialect::Classic,
     };
 
     // Load the session in simulate mode (won't actually execute commands)
@@ -94,6 +97,7 @@ fn test_load_session_with_malformed_data() {
         load_time: 1, // Reduced from 30 to 1 for faster tests
         adjust_clients_only: false,
         save_duplicate_pids: false,
+        dialect: hyprsession::dispatch::Dialect::Classic,
     };
     
     // This should handle malformed data gracefully
@@ -114,6 +118,7 @@ fn test_session_trait_save_method() {
         load_time: 1,
         adjust_clients_only: false,
         save_duplicate_pids: false,
+        dialect: hyprsession::dispatch::Dialect::Classic,
     };
 
     // Test saving a session (should work even in simulate mode for basic functionality)
@@ -134,6 +139,7 @@ fn test_session_trait_list_method() {
         load_time: 1,
         adjust_clients_only: false,
         save_duplicate_pids: false,
+        dialect: hyprsession::dispatch::Dialect::Classic,
     };
 
     // Create some mock session directories
@@ -163,6 +169,7 @@ fn test_session_trait_delete_method() {
         load_time: 1,
         adjust_clients_only: false,
         save_duplicate_pids: false,
+        dialect: hyprsession::dispatch::Dialect::Classic,
     };
 
     // Create a mock session directory
@@ -191,6 +198,7 @@ fn test_session_trait_clear_method() {
         load_time: 1,
         adjust_clients_only: false,
         save_duplicate_pids: false,
+        dialect: hyprsession::dispatch::Dialect::Classic,
     };
 
     // Test clearing session (should work in simulate mode)
@@ -216,6 +224,7 @@ fn test_local_session_struct_creation() {
         load_time: 60,
         adjust_clients_only: false,
         save_duplicate_pids: true,
+        dialect: hyprsession::dispatch::Dialect::Lua,
     };
 
     // Test simulation configuration
@@ -225,6 +234,7 @@ fn test_local_session_struct_creation() {
         load_time: 5,
         adjust_clients_only: true,
         save_duplicate_pids: false,
+        dialect: hyprsession::dispatch::Dialect::Classic,
     };
 
     // Verify fields are set correctly

@@ -6,12 +6,14 @@ use clap::{Parser, ValueEnum};
 
 pub mod command_detection;
 pub mod command_faker;
+pub mod dispatch;
 pub mod legacy;
 pub mod session;
 
 use crate::session::*;
 use crate::command_faker::fake_command;
 use crate::command_detection::command_exists_in_path;
+use crate::dispatch::{resolve_dialect, Dialect, DialectChoice};
 
 #[derive(Copy, Clone, PartialEq, ValueEnum)]
 enum Mode {
@@ -64,6 +66,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     simulate: bool,
 
+    /// Dispatch dialect: auto probes the running Hyprland (default: auto)
+    #[arg(long, value_enum, default_value_t = DialectChoice::Auto)]
+    dialect: DialectChoice,
+
     /// Only adjust exiting clients without launching new programs
     #[arg(long, default_value_t = false)]
     adjust_clients_only: bool,
@@ -105,12 +111,25 @@ fn main() -> hyprland::Result<()> {
         exit(1);
     }
 
+    // Only loading dispatches anything, so only it needs a resolved dialect
+    let dialect = if matches!(args.mode, Mode::Default | Mode::Load) {
+        let (dialect, source) = resolve_dialect(args.dialect, args.simulate).unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            exit(1);
+        });
+        println!("Dispatch dialect: {dialect} ({source})");
+        dialect
+    } else {
+        Dialect::Classic
+    };
+
     let session = LocalSession {
         base_path: session_path.clone(),
         load_time: args.load_time,
         adjust_clients_only: args.adjust_clients_only,
         simulate: args.simulate,
         save_duplicate_pids: false,
+        dialect,
     };
 
     match args.mode {
