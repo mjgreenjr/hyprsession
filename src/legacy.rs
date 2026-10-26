@@ -68,6 +68,7 @@ pub fn main() -> hyprland::Result<()> {
         simulate: args.simulate,
         save_duplicate_pids: args.save_duplicate_pids,
         dialect,
+        workspace: None,
     };
 
     if args.save_interval == 0 {

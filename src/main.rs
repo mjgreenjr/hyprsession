@@ -74,6 +74,10 @@ struct Args {
     /// Only adjust exiting clients without launching new programs
     #[arg(long, default_value_t = false)]
     adjust_clients_only: bool,
+
+    /// Only load this workspace of the session, leaving the others untouched (load mode only)
+    #[arg(long)]
+    workspace: Option<i32>,
 }
 
 fn migration_check(session_path: &str) {
@@ -124,6 +128,17 @@ fn main() -> hyprland::Result<()> {
         Dialect::Classic
     };
 
+    if let Some(workspace) = args.workspace {
+        if args.mode != Mode::Load {
+            eprintln!("Error: --workspace can only be used with the load mode");
+            exit(1);
+        }
+        if workspace < 1 {
+            eprintln!("Error: --workspace needs a workspace number of 1 or more");
+            exit(1);
+        }
+    }
+
     let session = LocalSession {
         base_path: session_path.clone(),
         load_time: args.load_time,
@@ -131,6 +146,7 @@ fn main() -> hyprland::Result<()> {
         simulate: args.simulate,
         save_duplicate_pids: false,
         dialect,
+        workspace: args.workspace,
     };
 
     match args.mode {

@@ -17,6 +17,7 @@ fn test_load_session_with_nonexistent_file() {
         adjust_clients_only: false,
         save_duplicate_pids: false,
         dialect: hyprsession::dispatch::Dialect::Classic,
+        workspace: None,
     };
 
     // This should not panic or fail when the session file doesn't exist
@@ -40,6 +41,7 @@ fn test_load_session_with_empty_file() {
         adjust_clients_only: false,
         save_duplicate_pids: false,
         dialect: hyprsession::dispatch::Dialect::Classic,
+        workspace: None,
     };
 
     // This should handle empty files gracefully
@@ -73,6 +75,7 @@ fn test_load_session_with_sample_data() {
         adjust_clients_only: false,
         save_duplicate_pids: false,
         dialect: hyprsession::dispatch::Dialect::Classic,
+        workspace: None,
     };
 
     // Load the session in simulate mode (won't actually execute commands)
@@ -98,6 +101,7 @@ fn test_load_session_with_malformed_data() {
         adjust_clients_only: false,
         save_duplicate_pids: false,
         dialect: hyprsession::dispatch::Dialect::Classic,
+        workspace: None,
     };
     
     // This should handle malformed data gracefully
@@ -119,6 +123,7 @@ fn test_session_trait_save_method() {
         adjust_clients_only: false,
         save_duplicate_pids: false,
         dialect: hyprsession::dispatch::Dialect::Classic,
+        workspace: None,
     };
 
     // Test saving a session (should work even in simulate mode for basic functionality)
@@ -140,6 +145,7 @@ fn test_session_trait_list_method() {
         adjust_clients_only: false,
         save_duplicate_pids: false,
         dialect: hyprsession::dispatch::Dialect::Classic,
+        workspace: None,
     };
 
     // Create some mock session directories
@@ -170,6 +176,7 @@ fn test_session_trait_delete_method() {
         adjust_clients_only: false,
         save_duplicate_pids: false,
         dialect: hyprsession::dispatch::Dialect::Classic,
+        workspace: None,
     };
 
     // Create a mock session directory
@@ -199,6 +206,7 @@ fn test_session_trait_clear_method() {
         adjust_clients_only: false,
         save_duplicate_pids: false,
         dialect: hyprsession::dispatch::Dialect::Classic,
+        workspace: None,
     };
 
     // Test clearing session (should work in simulate mode)
@@ -225,6 +233,7 @@ fn test_local_session_struct_creation() {
         adjust_clients_only: false,
         save_duplicate_pids: true,
         dialect: hyprsession::dispatch::Dialect::Lua,
+        workspace: None,
     };
 
     // Test simulation configuration
@@ -235,6 +244,7 @@ fn test_local_session_struct_creation() {
         adjust_clients_only: true,
         save_duplicate_pids: false,
         dialect: hyprsession::dispatch::Dialect::Classic,
+        workspace: None,
     };
 
     // Verify fields are set correctly
@@ -363,6 +373,7 @@ mod load_safety {
             adjust_clients_only: false,
             save_duplicate_pids: false,
             dialect: hyprsession::dispatch::Dialect::Lua,
+            workspace: None,
         }
     }
 
@@ -412,5 +423,34 @@ mod load_safety {
         assert!(session.load("").is_ok());
         // Nothing was written back
         assert_eq!(std::fs::read_to_string(dir.path().join("clients.json")).unwrap(), "[]");
+    }
+}
+
+mod workspace_flag_tests {
+    use std::process::Command;
+
+    fn run(args: &[&str]) -> std::process::Output {
+        let dir = tempfile::tempdir().unwrap();
+        Command::new(env!("CARGO_BIN_EXE_hyprsession"))
+            .args(args)
+            .env("HYPRSESSION_PATH", dir.path())
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_workspace_flag_is_for_load_mode_only() {
+        for mode in ["save", "clear", "list", "delete"] {
+            let out = run(&[mode, "--workspace", "2", "--simulate"]);
+            assert!(!out.status.success(), "{mode}");
+            assert!(String::from_utf8_lossy(&out.stderr).contains("--workspace"), "{mode}");
+        }
+    }
+
+    #[test]
+    fn test_workspace_flag_rejects_non_positive_numbers() {
+        let out = run(&["load", "--workspace", "0", "--simulate"]);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("1 or more"));
     }
 }

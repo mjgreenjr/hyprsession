@@ -389,6 +389,7 @@ impl Placer {
 }
 
 /// Everything load needs to know, decided before anything is touched
+#[derive(Debug)]
 pub struct LoadPlan {
     /// Launch lines in launch order (empty when only adjusting)
     pub entries: Vec<ExecEntry>,
@@ -498,6 +499,16 @@ pub struct ClearReport {
     pub closed: Vec<String>,
     pub termed: Vec<i32>,
     pub killed: Vec<i32>,
+    /// Windows that refused a graceful close but share their process with a window outside
+    /// the cleared scope, so were never signalled
+    pub refused: Vec<String>,
+}
+
+/// Which windows a clear is allowed to touch
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Scope {
+    All,
+    Workspace(i32),
 }
 
 fn describe(clients: &[Client]) -> String {
@@ -508,15 +519,21 @@ fn describe(clients: &[Client]) -> String {
         .join(", ")
 }
 
-/// Poll until no clients remain or the ticks run out; returns what is left
-fn wait_for_empty(host: &dyn Host, ticks: u64) -> Result<Vec<Client>, String> {
+/// Poll until `relevant` finds nothing left in the client list or the ticks run out;
+/// returns what is left
+fn wait_until(
+    host: &dyn Host,
+    ticks: u64,
+    relevant: &dyn Fn(&[Client]) -> Vec<Client>,
+) -> Result<Vec<Client>, String> {
     let mut last = None;
     for _ in 0..=ticks {
         if let Ok(live) = host.clients() {
-            if live.is_empty() {
-                return Ok(live);
+            let left = relevant(&live);
+            if left.is_empty() {
+                return Ok(left);
             }
-            last = Some(live);
+            last = Some(left);
         }
         if last.is_some() || ticks > 0 {
             host.pause();
@@ -536,23 +553,58 @@ fn signal_targets(clients: &[Client]) -> Vec<i32> {
     pids
 }
 
+/// Pids that have a live window outside the cleared scope: signalling one would take
+/// down a window the scope has no business touching
+pub fn shared_pids(live: &[Client], in_scope: &HashSet<Address>) -> HashSet<i32> {
+    live.iter().filter(|c| !in_scope.contains(&c.address)).map(|c| c.pid).collect()
+}
+
 /// Close every window, escalating only for what stays: graceful close, then SIGTERM,
 /// then SIGKILL, each followed by a bounded wait. Fails, naming the survivors, if
 /// anything outlives SIGKILL.
 pub fn clear_session(host: &dyn Host, config: &ClearConfig) -> Result<ClearReport, String> {
+    clear_windows(host, config, Scope::All)
+}
+
+/// `clear_session` restricted to a scope. Signal stages only reach pids whose live
+/// windows are **all** in scope: a window sharing its pid with another workspace's window
+/// gets the graceful close only, and if it refuses it is reported, never killed.
+pub fn clear_windows(host: &dyn Host, config: &ClearConfig, scope: Scope) -> Result<ClearReport, String> {
     let mut report = ClearReport::default();
-    let initial = host.clients().map_err(|e| format!("cannot read the client list: {e}"))?;
+    let all = host.clients().map_err(|e| format!("cannot read the client list: {e}"))?;
+    // Scope is fixed by address when the clear starts, so a window that moves mid-clear stays in or out
+    let initial: Vec<Client> = all
+        .iter()
+        .filter(|c| match scope {
+            Scope::All => true,
+            Scope::Workspace(id) => c.workspace.id == id,
+        })
+        .cloned()
+        .collect();
     if initial.is_empty() {
         return Ok(report);
     }
+    let in_scope: HashSet<Address> = initial.iter().map(|c| c.address.clone()).collect();
+    // Windows still open that belong to the scope (everything, for Scope::All)
+    let scoped = |live: &[Client]| -> Vec<Client> {
+        live.iter().filter(|c| scope == Scope::All || in_scope.contains(&c.address)).cloned().collect()
+    };
+    // The part of that which may be signalled: not sharing a pid with an out-of-scope window
+    let signalable = |live: &[Client]| -> Vec<Client> {
+        let shared = shared_pids(live, &in_scope);
+        scoped(live).into_iter().filter(|c| !shared.contains(&c.pid)).collect()
+    };
 
-    println!("Closing {} windows gracefully", initial.len());
+    match scope {
+        Scope::All => println!("Closing {} windows gracefully", initial.len()),
+        Scope::Workspace(id) => println!("Closing {} windows on workspace {id} gracefully", initial.len()),
+    }
     for client in &initial {
         if host.send(&Op::Close(client.address.clone())).is_err() {
             println!("Warning: close request failed for '{}'", client.title);
         }
     }
-    let mut left = wait_for_empty(host, config.close_ticks)?;
+    let mut left = wait_until(host, config.close_ticks, &scoped)?;
     let still_open: HashSet<&Address> = left.iter().map(|c| &c.address).collect();
     report.closed = initial
         .iter()
@@ -563,28 +615,49 @@ pub fn clear_session(host: &dyn Host, config: &ClearConfig) -> Result<ClearRepor
     for title in &report.closed {
         println!("  closed '{title}'");
     }
-    if left.is_empty() {
+
+    let finish = |report: &mut ClearReport, host: &dyn Host| {
+        // Whatever is still there only because a pid is shared is reported, not killed
+        if let Ok(live) = host.clients() {
+            let shared = shared_pids(&live, &in_scope);
+            report.refused = scoped(&live)
+                .iter()
+                .filter(|c| shared.contains(&c.pid))
+                .map(|c| format!("'{}' ({}, pid {})", c.title, c.class, c.pid))
+                .collect();
+        }
+        for window in &report.refused {
+            println!("Warning: {window} would not close and shares its process with another workspace; not signalled");
+        }
+    };
+
+    if scoped(&left).is_empty() {
         return Ok(report);
     }
-
-    let pids = signal_targets(&left);
-    println!("Still open after graceful close: {}", describe(&left));
-    println!("Sending SIGTERM to pids {pids:?}");
-    pids.iter().for_each(|&pid| host.signal(pid, Signal::Term));
-    report.termed = pids;
-    left = wait_for_empty(host, config.term_ticks)?;
-    if left.is_empty() {
-        return Ok(report);
-    }
-
-    let pids = signal_targets(&left);
-    println!("Still open after SIGTERM: {}", describe(&left));
-    println!("Sending SIGKILL to pids {pids:?}");
-    pids.iter().for_each(|&pid| host.signal(pid, Signal::Kill));
-    report.killed = pids;
-    left = wait_for_empty(host, config.kill_ticks)?;
-    if left.is_empty() {
-        return Ok(report);
+    for (stage, signal, ticks) in [
+        ("graceful close", Signal::Term, config.term_ticks),
+        ("SIGTERM", Signal::Kill, config.kill_ticks),
+    ] {
+        let live = host.clients().map_err(|e| format!("cannot read the client list: {e}"))?;
+        let stuck = signalable(&live);
+        if stuck.is_empty() {
+            finish(&mut report, host);
+            return Ok(report);
+        }
+        let pids = signal_targets(&stuck);
+        println!("Still open after {stage}: {}", describe(&stuck));
+        println!("Sending {} to pids {pids:?}", if signal == Signal::Term { "SIGTERM" } else { "SIGKILL" });
+        pids.iter().for_each(|&pid| host.signal(pid, signal));
+        if signal == Signal::Term {
+            report.termed = pids;
+        } else {
+            report.killed = pids;
+        }
+        left = wait_until(host, ticks, &signalable)?;
+        if left.is_empty() {
+            finish(&mut report, host);
+            return Ok(report);
+        }
     }
 
     Err(format!(
@@ -602,10 +675,17 @@ fn apply(host: &dyn Host, live: &Client, wanted: &Client) {
     }
 }
 
-/// Place every live window that claims a saved client; returns the windows claimed now
-fn place_live(host: &dyn Host, placer: &mut Placer, live: &[Client], report: &mut LoadReport) -> Vec<Address> {
+/// Place every live window that claims a saved client; returns the windows claimed now.
+/// Protected windows (other workspaces in a scoped load) are never claimed.
+fn place_live(
+    host: &dyn Host,
+    placer: &mut Placer,
+    live: &[Client],
+    protected: &HashSet<Address>,
+    report: &mut LoadReport,
+) -> Vec<Address> {
     let mut claimed = vec![];
-    for window in live.iter().filter(|c| c.mapped) {
+    for window in live.iter().filter(|c| c.mapped && !protected.contains(&c.address)) {
         if let Some(wanted) = placer.assign(window) {
             apply(host, window, &wanted);
             report.placed += 1;
@@ -621,6 +701,7 @@ fn settle_group(
     host: &dyn Host,
     placer: &mut Placer,
     before: &HashSet<Address>,
+    protected: &HashSet<Address>,
     expected: usize,
     claimed: &mut usize,
     report: &mut LoadReport,
@@ -630,7 +711,7 @@ fn settle_group(
         host.pause();
         stable += 1;
         let Ok(live) = host.clients() else { continue };
-        let new = place_live(host, placer, &live, report)
+        let new = place_live(host, placer, &live, protected, report)
             .into_iter()
             .filter(|a| !before.contains(a))
             .count();
@@ -651,11 +732,12 @@ fn fulfil_group(
     entry: &ExecEntry,
     group: &GroupInfo,
     before: &HashSet<Address>,
+    protected: &HashSet<Address>,
     mut claimed: usize,
     report: &mut LoadReport,
 ) {
     let expected = group.saved.len();
-    settle_group(host, placer, before, expected, &mut claimed, report);
+    settle_group(host, placer, before, protected, expected, &mut claimed, report);
     let mut reinvocations = 0;
     if claimed > 0 {
         let bound = expected.saturating_sub(claimed);
@@ -665,7 +747,7 @@ fn fulfil_group(
             if host.send(&Op::Exec(entry.command.clone())).is_err() {
                 break;
             }
-            settle_group(host, placer, before, expected, &mut claimed, report);
+            settle_group(host, placer, before, protected, expected, &mut claimed, report);
         }
     }
     if claimed < expected {
@@ -687,6 +769,15 @@ fn fulfil_group(
 pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
     let mut placer = Placer::new(if plan.place_by_class { plan.saved.clone() } else { vec![] });
     let mut report = LoadReport::default();
+    // In a scoped load, every window that is not on the loaded workspace is off limits:
+    // never claimed, moved, or reported
+    let protected: HashSet<Address> = match plan.scope {
+        Some(workspace) => host
+            .clients()
+            .map(|c| c.into_iter().filter(|c| c.workspace.id != workspace).map(|c| c.address).collect())
+            .unwrap_or_default(),
+        None => HashSet::new(),
+    };
 
     for entry in &plan.entries {
         let before: HashSet<Address> = host
@@ -702,7 +793,7 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
             host.pause();
             let Ok(live) = host.clients() else { continue };
             if plan.place_by_class {
-                claimed += place_live(host, &mut placer, &live, &mut report)
+                claimed += place_live(host, &mut placer, &live, &protected, &mut report)
                     .into_iter()
                     .filter(|a| !before.contains(a))
                     .count();
@@ -717,7 +808,7 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
             }
         }
         if let (true, Some(group)) = (plan.place_by_class, entry.group.as_ref()) {
-            fulfil_group(host, &mut placer, entry, group, &before, claimed, &mut report);
+            fulfil_group(host, &mut placer, entry, group, &before, &protected, claimed, &mut report);
         }
     }
 
@@ -727,7 +818,7 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
             host.pause();
             ticks += 1;
             if let Ok(live) = host.clients() {
-                place_live(host, &mut placer, &live, &mut report);
+                place_live(host, &mut placer, &live, &protected, &mut report);
             }
         }
         report.unmatched = placer.unmatched().into_iter().cloned().collect();
@@ -738,7 +829,7 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
             let claimed = placer.claimed_addresses();
             report.surplus = live
                 .into_iter()
-                .filter(|c| c.mapped && !claimed.contains(&c.address))
+                .filter(|c| c.mapped && !claimed.contains(&c.address) && !protected.contains(&c.address))
                 .collect();
         }
     }
@@ -1439,5 +1530,107 @@ mod tests {
         host.resist.borrow_mut().insert(0, 3);
         assert!(clear_session(&host, &FAST).is_err());
         assert!(host.signals.borrow().is_empty());
+    }
+
+    /// A window of `class` owned by `pid` on workspace `ws`; `n` keeps addresses distinct
+    fn win(class: &str, pid: i32, ws: i32, n: i16) -> Client {
+        let mut c = client(class, &format!("{class} {n}"), ws, false, (n, 0), (1, 1));
+        c.pid = pid;
+        c.address = hyprland::shared::Address::new(format!("0x{:x}{:02x}", ws, n));
+        c
+    }
+
+    fn addresses(host: &FakeHost) -> Vec<String> {
+        let mut a: Vec<String> = host.windows.borrow().iter().map(|(_, c)| c.address.to_string()).collect();
+        a.sort();
+        a
+    }
+
+    #[test]
+    fn test_scoped_clear_leaves_other_workspaces_alone() {
+        let host = FakeHost::new(
+            vec![win("kitty", 10, 1, 1), win("brave", 20, 1, 2), win("mpv", 30, 2, 3), win("foot", 40, 2, 4)],
+            vec![],
+        );
+        let report = clear_windows(&host, &FAST, Scope::Workspace(1)).unwrap();
+        assert_eq!(report.closed.len(), 2);
+        // Only workspace 1 was asked to close; workspace 2's addresses are untouched
+        let closes: Vec<_> = host.sent.borrow().iter().filter(|o| matches!(o, Op::Close(_))).cloned().collect();
+        assert_eq!(closes.len(), 2);
+        assert_eq!(addresses(&host), vec!["0x203".to_string(), "0x204".to_string()]);
+        assert!(host.signals.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_scoped_clear_never_signals_a_pid_shared_with_another_workspace() {
+        // pid 50 owns a window on workspace 1 and one on workspace 2; it ignores close and TERM
+        let host = FakeHost::new(
+            vec![win("brave", 50, 1, 1), win("brave", 50, 2, 2), win("kitty", 60, 1, 3)],
+            vec![],
+        );
+        host.resist.borrow_mut().insert(50, 2);
+        let report = clear_windows(&host, &FAST, Scope::Workspace(1)).unwrap();
+        // The refusing window is reported, no signal ever reached pid 50, both its windows survive
+        assert_eq!(report.refused.len(), 1);
+        assert!(report.refused[0].contains("pid 50"), "{:?}", report.refused);
+        assert!(host.signals.borrow().iter().all(|(pid, _)| *pid != 50));
+        assert_eq!(addresses(&host), vec!["0x101".to_string(), "0x202".to_string()]);
+    }
+
+    #[test]
+    fn test_scoped_clear_still_escalates_for_pids_wholly_in_scope() {
+        let host = FakeHost::new(
+            vec![win("spotify", 70, 1, 1), win("spotify", 70, 1, 2), win("other", 80, 2, 3), win("shared", 90, 1, 4), win("shared", 90, 2, 5)],
+            vec![],
+        );
+        host.resist.borrow_mut().insert(70, 1);
+        host.resist.borrow_mut().insert(90, 3);
+        let report = clear_windows(&host, &FAST, Scope::Workspace(1)).unwrap();
+        assert_eq!(*host.signals.borrow(), vec![(70, Signal::Term)]);
+        assert_eq!(report.termed, vec![70]);
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(addresses(&host), vec!["0x104".to_string(), "0x203".to_string(), "0x205".to_string()]);
+    }
+
+    #[test]
+    fn test_scoped_clear_aborts_when_an_in_scope_pid_survives_sigkill() {
+        let host = FakeHost::new(vec![win("zombie", 60, 1, 1), win("kitty", 70, 2, 2)], vec![]);
+        host.resist.borrow_mut().insert(60, 3);
+        let err = clear_windows(&host, &FAST, Scope::Workspace(1)).unwrap_err();
+        assert!(err.contains("pid 60") && !err.contains("kitty"), "{err}");
+    }
+
+    #[test]
+    fn test_scoped_clear_of_an_empty_workspace_does_nothing() {
+        let host = FakeHost::new(vec![win("kitty", 10, 2, 1)], vec![]);
+        clear_windows(&host, &FAST, Scope::Workspace(1)).unwrap();
+        assert!(host.sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_scoped_load_never_claims_or_moves_other_workspaces_windows() {
+        // Saved: a brave on workspace 1. Live: a brave already on workspace 2 (untouched
+        // layout) and a brave that appears from the launch
+        let other = win("brave", 11, 2, 1);
+        let launched = win("brave", 12, 1, 2);
+        let host = FakeHost::new(vec![other.clone()], vec![vec![(1, launched.clone())]]);
+        let plan = LoadPlan {
+            entries: vec![group_entry("brave", vec![0])],
+            saved: vec![client("brave", "w", 1, false, (0, 0), (1, 1))],
+            place_by_class: true,
+            tail_ticks: 3,
+            scope: Some(1),
+            restore_workspace: Some(2),
+        };
+        let report = run_load(&host, &plan);
+        assert_eq!(report.placed, 1);
+        let sent = host.sent.borrow();
+        let touches = |a: &hyprland::shared::Address| sent.iter().any(|o| format!("{o:?}").contains(&a.to_string()));
+        assert!(!touches(&other.address), "{sent:?}");
+        // The only focus change is the v1 return-to-start
+        let focuses: Vec<_> = sent.iter().filter(|o| matches!(o, Op::FocusWorkspace(_) | Op::FocusWindow(_))).collect();
+        assert_eq!(focuses, vec![&Op::FocusWorkspace(2)]);
+        // And it is not reported as surplus either
+        assert!(report.surplus.is_empty());
     }
 }

@@ -3,7 +3,7 @@ use hyprland::shared::{HyprData, HyprDataActive};
 use crate::command_detection::{fetch_command, read_argv, read_cwd};
 use serde::{Deserialize, Serialize};
 use crate::dispatch::{Dialect, Dispatcher, Op, WorkspaceTarget};
-use crate::load::{desired_from_rules, launch_entries_from_saved, launch_order, placeholder_client, parse_exec_conf, run_load, clear_session, ClearConfig, LoadPlan, RealHost};
+use crate::load::{clear_windows, RuleWorkspace, Scope, desired_from_rules, launch_entries_from_saved, launch_order, placeholder_client, parse_exec_conf, run_load, ClearConfig, LoadPlan, RealHost};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -156,6 +156,8 @@ pub struct LocalSession {
     pub adjust_clients_only: bool,
     pub save_duplicate_pids: bool,
     pub dialect: Dialect,
+    /// Load only this workspace's slice of the snapshot
+    pub workspace: Option<i32>,
 }
 
 /// Work out which dispatches bring a live window in line with its saved client
@@ -216,6 +218,23 @@ pub fn plan_adjustment(real_client: &Client, session_client: &Client) -> Vec<Op>
 }
 
 impl LocalSession {
+    fn clear_scope(&self, scope: Scope) -> hyprland::Result<()> {
+        if !self.simulate {
+            let host = RealHost { dispatcher: Dispatcher::new(self.dialect, false) };
+            let report = clear_windows(&host, &ClearConfig::default(), scope)
+                .map_err(hyprland::error::HyprError::Other)?;
+            if !report.refused.is_empty() {
+                println!("Not closed (shared with another workspace): {}", report.refused.join(", "));
+            }
+        }
+
+        match scope {
+            Scope::All => println!("Cleared existing session"),
+            Scope::Workspace(id) => println!("Cleared workspace {id}"),
+        }
+        Ok(())
+    }
+
     /// Read and validate a snapshot, returning what load will do
     fn prepare_load(&self, base_dir: &std::path::Path) -> hyprland::Result<LoadPlan> {
         let fail = |msg: String| hyprland::error::HyprError::Other(msg);
@@ -246,11 +265,30 @@ impl LocalSession {
         let new_format = saved.iter().any(|c| c.argv.is_some());
         let place_by_class = self.adjust_clients_only || new_format;
 
+        // A scoped load works on one workspace's slice of the snapshot only
+        let saved: Vec<SavedClient> = match self.workspace {
+            Some(workspace) => {
+                let slice: Vec<SavedClient> =
+                    saved.into_iter().filter(|c| c.client.workspace.id == workspace).collect();
+                if place_by_class && slice.is_empty() {
+                    return Err(fail(format!("the snapshot has no windows on workspace {workspace}")));
+                }
+                slice
+            }
+            None => saved,
+        };
+
         // New-format snapshots launch exactly what was recorded (argv); exec.conf has
         // been validated above but its lines went through command heuristics and
         // remain the launch source only for legacy snapshots
         if new_format && !self.adjust_clients_only {
             entries = launch_entries_from_saved(&saved, &crate::command_faker::build_xdg_command_map());
+        } else if let Some(workspace) = self.workspace {
+            // Legacy launch lines carry their workspace in their rules
+            entries.retain(|e| e.rules.workspace == Some(RuleWorkspace::Id(workspace)));
+            if entries.is_empty() && !self.adjust_clients_only {
+                return Err(fail(format!("the snapshot has no launch lines for workspace {workspace}")));
+            }
         }
 
         Ok(LoadPlan {
@@ -258,7 +296,7 @@ impl LocalSession {
             saved: if place_by_class { saved.into_iter().map(|c| c.client).collect() } else { vec![] },
             place_by_class,
             tail_ticks: LoadPlan::tail_ticks_for(self.load_time),
-            scope: None,
+            scope: self.workspace,
             restore_workspace: if self.simulate { None } else { Workspace::get_active().ok().map(|w| w.id) },
         })
     }
@@ -267,6 +305,13 @@ impl LocalSession {
 /// Print what a load would send. Windows to place do not exist yet, so their
 /// dispatches are shown against a placeholder address.
 fn simulate_load(dispatcher: &Dispatcher, plan: &LoadPlan) {
+    if let Some(workspace) = plan.scope {
+        println!(
+            "Scoped to workspace {workspace}: closing only its windows (a process shared with another \
+             workspace is closed gracefully, never signalled) and launching {} programs",
+            plan.entries.len()
+        );
+    }
     for entry in &plan.entries {
         let _ = dispatcher.send(&Op::Exec(entry.command.clone()));
         if let Some(group) = entry.group.as_ref().filter(|g| g.saved.len() > 1) {
@@ -391,7 +436,10 @@ impl Session for LocalSession {
             simulate_load(&dispatcher, &plan);
         } else {
             if !self.adjust_clients_only {
-                self.clear()?;
+                match self.workspace {
+                    Some(workspace) => self.clear_scope(Scope::Workspace(workspace))?,
+                    None => self.clear()?,
+                }
             }
             let host = RealHost { dispatcher };
             let report = run_load(&host, &plan);
@@ -405,14 +453,7 @@ impl Session for LocalSession {
     }
 
     fn clear(&self) -> hyprland::Result<()> {
-        if !self.simulate {
-            let host = RealHost { dispatcher: Dispatcher::new(self.dialect, false) };
-            clear_session(&host, &ClearConfig::default())
-                .map_err(hyprland::error::HyprError::Other)?;
-        }
-
-        println!("Cleared existing session");
-        Ok(())
+        self.clear_scope(Scope::All)
     }
 
     fn list(&self) -> impl Iterator<Item=String> {
@@ -498,7 +539,12 @@ mod tests {
             adjust_clients_only: false,
             save_duplicate_pids: false,
             dialect: Dialect::Lua,
+            workspace: None,
         }
+    }
+
+    fn scoped_session(dir: &std::path::Path, workspace: i32) -> LocalSession {
+        LocalSession { workspace: Some(workspace), ..sim_session(dir) }
     }
 
     fn write_clients(dir: &std::path::Path, clients: &[SavedClient]) {
@@ -668,5 +714,58 @@ mod tests {
         let mut anon = client("a", "t", -99, false, (0, 0), (1, 1));
         anon.workspace.name = "special".to_string();
         assert!(plan_adjustment(&real, &anon).is_empty());
+    }
+
+    #[test]
+    fn test_scoped_load_plans_only_the_requested_workspaces_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(EXEC_NAME), "[workspace 1 silent] kitty\n").unwrap();
+        let mut brave = with_argv("brave", &["/opt/brave/brave", "--profile-directory=P"], 2, (0, 0));
+        brave.client.pid = 21;
+        let mut brave_other = with_argv("brave", &["/opt/brave/brave", "--profile-directory=P"], 3, (0, 0));
+        brave_other.client.pid = 21;
+        write_clients(dir.path(), &[
+            with_argv("kitty", &["kitty"], 1, (0, 0)),
+            brave,
+            brave_other,
+        ]);
+        let plan = scoped_session(dir.path(), 2).prepare_load(dir.path()).unwrap();
+        assert_eq!(plan.scope, Some(2));
+        assert_eq!(plan.saved.len(), 1);
+        assert_eq!(plan.saved[0].workspace.id, 2);
+        // Only the process behind workspace 2's window is launched, expecting one window
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].group.as_ref().unwrap().saved, vec![0]);
+        assert!(plan.entries[0].command.contains("brave"));
+    }
+
+    #[test]
+    fn test_scoped_load_of_a_workspace_with_no_saved_windows_fails_before_anything_is_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(EXEC_NAME), "[workspace 1 silent] kitty\n").unwrap();
+        write_clients(dir.path(), &[with_argv("kitty", &["kitty"], 1, (0, 0))]);
+        let err = scoped_session(dir.path(), 4).prepare_load(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("workspace 4"), "{err}");
+    }
+
+    #[test]
+    fn test_scoped_load_of_a_legacy_snapshot_filters_launch_lines_by_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(EXEC_NAME),
+            "[workspace 1 silent;move 0 0] kitty\n[workspace 2 silent;move 0 0] brave\n",
+        ).unwrap();
+        let plan = scoped_session(dir.path(), 2).prepare_load(dir.path()).unwrap();
+        let commands: Vec<&str> = plan.entries.iter().map(|e| e.command.as_str()).collect();
+        assert_eq!(commands, vec!["brave"]);
+        assert!(scoped_session(dir.path(), 9).prepare_load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn test_scoped_simulate_load_succeeds_and_sends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(EXEC_NAME), "[workspace 1 silent] kitty\n").unwrap();
+        write_clients(dir.path(), &[with_argv("kitty", &["kitty"], 1, (0, 0))]);
+        assert!(scoped_session(dir.path(), 1).load("").is_ok());
     }
 }

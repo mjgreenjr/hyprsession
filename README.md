@@ -76,6 +76,13 @@ The dialect in use is printed when a session is loaded.
 When loading a session this tell Hyprsession to not clear the current session and restart programs. 
 Instead it moves the existing clients to match the saved session.
 
+### --workspace <workspace>
+Only restore one workspace of the saved session (`hyprsession load <name> --workspace 3`).
+Only the windows on that workspace are closed and only the programs behind its saved windows are
+launched; other workspaces' windows are not moved, closed or focused. A window on that workspace
+that shares its process with a window on another workspace is closed gracefully but never killed;
+if it refuses to close it is reported. Works with `load` only.
+
 ### --mode <mode> (depreciated)
 Sets the mode the program runs in 
 * Default - Loads the session at startup the saves the current session at regular intervals.
