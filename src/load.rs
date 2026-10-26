@@ -5,11 +5,11 @@
 //! tested against a fake one.
 
 use crate::dispatch::{Dispatcher, Op};
-use crate::command_detection::shell_join;
+use crate::command_detection::{resolve_desktop_command, shell_join};
 use crate::session::{plan_adjustment, SavedClient};
 use hyprland::data::{Client, Clients, FullscreenMode, Workspace};
 use hyprland::shared::{Address, HyprData, HyprDataActive};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Polls per second while waiting for windows
 const TICKS_PER_SECOND: u64 = 4;
@@ -160,17 +160,37 @@ fn command_from_saved_argv(argv: &[String]) -> Option<String> {
     }
 }
 
+/// Whether the recorded program is the inside view of a Flatpak sandbox (`/app/...`),
+/// which does not exist on the host
+fn is_sandbox_internal(argv: &[String]) -> bool {
+    argv.first()
+        .and_then(|first| first.split_whitespace().next())
+        .map_or(false, |program| program.starts_with("/app/"))
+}
+
 /// Launch entries for a new-format snapshot, built from the recorded argv. Windows are
 /// grouped by command; each distinct pid in a group is one launch (identical commands
 /// in separate processes are separate launches, windows sharing a process are one),
-/// with rules taken from the group's first saved window. Windows without argv cannot
-/// be launched and are skipped (they are still placed if their app brings them up).
-pub fn launch_entries_from_saved(saved: &[SavedClient]) -> Vec<ExecEntry> {
+/// with rules taken from the group's first saved window. A window whose argv is
+/// sandbox-internal launches through its desktop entry instead. Windows without argv
+/// cannot be launched and are skipped (they are still placed if their app brings them
+/// up).
+pub fn launch_entries_from_saved(saved: &[SavedClient], xdg_map: &HashMap<String, String>) -> Vec<ExecEntry> {
     let mut entries: Vec<ExecEntry> = vec![];
-    let mut group_rules: std::collections::HashMap<String, ExecRules> = Default::default();
+    let mut group_rules: HashMap<String, ExecRules> = HashMap::new();
     let mut launched: HashSet<(String, i32)> = HashSet::new();
     for window in saved {
-        let Some(command) = window.argv.as_deref().and_then(command_from_saved_argv) else { continue };
+        let Some(argv) = window.argv.as_deref() else { continue };
+        let Some(mut command) = command_from_saved_argv(argv) else { continue };
+        if is_sandbox_internal(argv) {
+            match resolve_desktop_command(&window.client, xdg_map) {
+                Some(entry_command) => command = entry_command,
+                None => println!(
+                    "Warning: '{}' ({}) runs inside a sandbox and has no desktop entry; launching its recorded command",
+                    window.client.title, window.client.class
+                ),
+            }
+        }
         let rules = group_rules
             .entry(command.clone())
             .or_insert_with(|| rules_from_client(&window.client))
@@ -624,7 +644,7 @@ mod tests {
 
     #[test]
     fn test_launch_entries_from_saved_argv() {
-        let entries = launch_entries_from_saved(&[
+        let entries = launch_entries_from_saved_no_xdg(&[
             saved("brave", Some(&["/opt/brave/brave", "--app=https://example.test/a b"]), 5, false, (0, 0)),
             // Another window of the same process: same command, not launched again
             saved("brave", Some(&["/opt/brave/brave", "--app=https://example.test/a b"]), 6, true, (9, 9)),
@@ -644,6 +664,10 @@ mod tests {
         assert_eq!(entries[1].rules.at, Some((3, 4)));
     }
 
+    fn launch_entries_from_saved_no_xdg(saved: &[SavedClient]) -> Vec<ExecEntry> {
+        launch_entries_from_saved(saved, &HashMap::new())
+    }
+
     fn saved_pid(class: &str, argv: &[&str], pid: i32, at: (i16, i16)) -> SavedClient {
         let mut window = saved(class, Some(argv), 1, false, at);
         window.client.pid = pid;
@@ -654,19 +678,19 @@ mod tests {
     fn test_single_element_argv_is_used_verbatim() {
         // Chromium-family cmdline: one space-joined string with shell quotes embedded
         let blob = r#"/opt/electronmail/electron-mail --class=electron-mail --name="Electron Mail" --user-data-dir='/home/x/em data'"#;
-        let entries = launch_entries_from_saved(&[saved_pid("electron-mail", &[blob], 7, (0, 0))]);
+        let entries = launch_entries_from_saved_no_xdg(&[saved_pid("electron-mail", &[blob], 7, (0, 0))]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].command, blob);
         // Multi-element argv is still shell-joined
-        let entries = launch_entries_from_saved(&[saved_pid("x", &["a b", "c"], 8, (0, 0))]);
+        let entries = launch_entries_from_saved_no_xdg(&[saved_pid("x", &["a b", "c"], 8, (0, 0))]);
         assert_eq!(entries[0].command, "'a b' c");
         // A blank single element is not a command
-        assert!(launch_entries_from_saved(&[saved_pid("x", &["  "], 9, (0, 0))]).is_empty());
+        assert!(launch_entries_from_saved_no_xdg(&[saved_pid("x", &["  "], 9, (0, 0))]).is_empty());
     }
 
     #[test]
     fn test_same_command_in_separate_processes_is_launched_per_pid() {
-        let entries = launch_entries_from_saved(&[
+        let entries = launch_entries_from_saved_no_xdg(&[
             saved_pid("foot", &["foot"], 101, (0, 0)),
             saved_pid("foot", &["foot"], 102, (10, 0)),
             saved_pid("foot", &["foot"], 103, (20, 0)),
@@ -679,12 +703,41 @@ mod tests {
 
     #[test]
     fn test_two_windows_of_one_pid_are_one_launch() {
-        let entries = launch_entries_from_saved(&[
+        let entries = launch_entries_from_saved_no_xdg(&[
             saved_pid("brave", &["brave --profile-directory=Default"], 55, (0, 0)),
             saved_pid("brave", &["brave --profile-directory=Default"], 55, (30, 0)),
             saved_pid("brave", &["brave --profile-directory=Default"], 56, (60, 0)),
         ]);
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn test_sandbox_internal_argv_launches_through_the_desktop_entry() {
+        let mut xdg = HashMap::new();
+        xdg.insert(
+            crate::command_faker::xdg_id_key("dev.vencord.vesktop"),
+            "/usr/bin/flatpak run --command=vesktop dev.vencord.Vesktop".to_string(),
+        );
+        let mut vesktop = saved_pid("dev.vencord.Vesktop", &["/app/bin/vesktop/vesktop.bin --no-sandbox"], 40, (0, 0));
+        vesktop.client.initial_class = "dev.vencord.Vesktop".to_string();
+        let mut vesktop2 = vesktop.clone();
+        vesktop2.client.pid = 41;
+        let host_app = saved_pid("kitty", &["/usr/bin/kitty --single-instance"], 42, (0, 0));
+        let entries = launch_entries_from_saved(&[vesktop.clone(), vesktop2, host_app], &xdg);
+        let commands: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
+        // The entry command replaces the blob; multiplicity is still per pid; the host app is untouched
+        assert_eq!(commands, vec![
+            "/usr/bin/flatpak run --command=vesktop dev.vencord.Vesktop",
+            "/usr/bin/flatpak run --command=vesktop dev.vencord.Vesktop",
+            "/usr/bin/kitty --single-instance",
+        ]);
+        // Multi-element sandbox argv is recognised too
+        let multi = saved_pid("dev.vencord.Vesktop", &["/app/bin/vesktop", "--x"], 43, (0, 0));
+        let entries = launch_entries_from_saved(&[multi], &xdg);
+        assert!(entries[0].command.starts_with("/usr/bin/flatpak run"));
+        // With no desktop entry the recorded command is kept
+        let entries = launch_entries_from_saved(&[vesktop], &HashMap::new());
+        assert_eq!(entries[0].command, "/app/bin/vesktop/vesktop.bin --no-sandbox");
     }
 
     #[test]

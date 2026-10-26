@@ -111,6 +111,15 @@ fn resolve_class_by_app_id(class: &str, xdg_map: &HashMap<String, String>) -> Op
     xdg_map.get(&xdg_id_key(class)).cloned()
 }
 
+/// The desktop-entry command for a window, resolved the way `fetch_command` resolves
+/// it: desktop file id by class, then entry name by class, then entry name by title
+pub fn resolve_desktop_command(client: &Client, xdg_map: &HashMap<String, String>) -> Option<String> {
+    resolve_class_by_app_id(&client.initial_class, xdg_map)
+        .or_else(|| resolve_class_by_app_id(&client.class, xdg_map))
+        .or_else(|| xdg_map.get(&client.initial_class.to_lowercase()).cloned())
+        .or_else(|| xdg_map.get(&client.initial_title.to_lowercase()).cloned())
+}
+
 fn handle_initial_title(client: &Client) -> Result<String, std::io::Error> {
     Ok(client.initial_title.to_lowercase())
 }

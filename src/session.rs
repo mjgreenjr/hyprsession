@@ -231,7 +231,7 @@ impl LocalSession {
         // been validated above but its lines went through command heuristics and
         // remain the launch source only for legacy snapshots
         if new_format && !self.adjust_clients_only {
-            entries = launch_entries_from_saved(&saved);
+            entries = launch_entries_from_saved(&saved, &crate::command_faker::build_xdg_command_map());
         }
 
         Ok(LoadPlan {
