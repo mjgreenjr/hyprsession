@@ -80,7 +80,7 @@ EOF
   [ "$(reading_order "$t/a.json" 9 | sed -n 2p)" = "10 520 foot --working-directory=/x/d3" ] || die "selftest: reading order is x then y"
   rm -rf "$t"
   if command -v python3 >/dev/null 2>&1; then
-    python3 -I "$(dirname "$0")/test_dwindle_model.py" >/dev/null 2>&1 || die "selftest: dwindle_model tests failed (run scripts/test_dwindle_model.py)"
+    PYTHONDONTWRITEBYTECODE=1 python3 -I "$(dirname "$0")/test_dwindle_model.py" >/dev/null 2>&1 || die "selftest: dwindle_model tests failed (run scripts/test_dwindle_model.py)"
   fi
   echo "selftest ok"
 }

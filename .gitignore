@@ -17,3 +17,4 @@ result
 # VM temporary files
 **/vm-test/*.qcow2
 **/vm-test/vm-state-*
+__pycache__/
