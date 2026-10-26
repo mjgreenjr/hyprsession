@@ -6,7 +6,9 @@
 # distinct working directories. Nothing else on the desktop is closed or moved: the hyprsession
 # loads are scoped (--workspace), and the prototype only touches windows it launched itself.
 #
-# Commands:  preflight | build | baseline | proto | proto-focus | export-fixture OUT | all | cleanup | selftest
+# Commands:  preflight | build | baseline | proto | proto-focus | export-fixture SNAP OUT | all | cleanup | selftest
+# Spike #2 (split-target rule + computed insertion order; see docs/v1.2-plan.md, "Spike #2"):
+#            rule | shape-insert NAME N | shape-hand NAME N | computed NAME | bar | spike2
 # See docs/v1.2-plan.md ("The spike") for what to run and what to paste back.
 #
 # Requires: hyprctl, jq, foot, a built hyprsession binary ($HYPRSESSION, default
@@ -27,6 +29,10 @@ STAGE=0                                   # set by proto: 1 parks held windows o
 FOCUS=0                                   # set by proto-focus: focus each window after moving it (DEC-B EXPERIMENT)
 SESS="$DIR/sessions"
 REPORT="$DIR/report.txt"
+RUNS="$DIR/runs"
+MODEL="$(cd "$(dirname "$0")" && pwd)/dwindle_model.py"
+POINTER_MODE="${SPIKE_POINTER:-auto}"     # auto: try to warp the pointer, else ask you; manual: always ask; ignore: only log it
+ALLOW_POINTER="${SPIKE_ALLOW_POINTER:-0}" # computed ... steer warps the pointer before every move (new side effect: needs a ruling)
 
 log() { printf '%s\n' "$*" | tee -a "$REPORT" >&2; }
 die() { printf 'spike: %s\n' "$*" >&2; exit 1; }
@@ -73,6 +79,9 @@ EOF
   [ "$(reading_order "$t/a.json" 9 | head -1)" = "10 10 foot --working-directory=/x/d1" ] || die "selftest: reading order"
   [ "$(reading_order "$t/a.json" 9 | sed -n 2p)" = "10 520 foot --working-directory=/x/d3" ] || die "selftest: reading order is x then y"
   rm -rf "$t"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -I "$(dirname "$0")/test_dwindle_model.py" >/dev/null 2>&1 || die "selftest: dwindle_model tests failed (run scripts/test_dwindle_model.py)"
+  fi
   echo "selftest ok"
 }
 
@@ -122,6 +131,16 @@ dsp_close() { # address
 clients_on() { hyprctl clients -j | jq -c --argjson ws "$1" '[.[] | select(.workspace.id == $ws and .mapped)]'; }
 all_addresses() { hyprctl clients -j | jq -r '.[] | select(.mapped) | .address' | sort; }
 active_ws() { hyprctl activeworkspace -j | jq -r '.id'; }
+is_fixture() { # pid -> success if the window is one of this script's foot fixture windows
+  { tr '\0' ' ' <"/proc/$1/cmdline"; } 2>/dev/null | grep -qF -- "--working-directory=$DIR/cwd/"
+}
+# Refuse to touch a scratch workspace that holds anything but this script's own fixture windows
+fixture_only_or_die() {
+  local pid
+  for pid in $(clients_on "$WS" | jq -r '.[].pid'); do
+    is_fixture "$pid" || die "workspace $WS holds a window that is not a spike fixture window (pid $pid); refusing to close or reload over it. Use an empty scratch workspace (SPIKE_WS=N)."
+  done
+}
 tag() { # short label of a window for tables: the fixture directory of its foot
   local pid="$1"
   { tr '\0' ' ' <"/proc/$pid/cmdline"; } 2>/dev/null | sed -n 's#.*working-directory=\([^ ]*\).*#\1#p' | sed 's#.*/##'
@@ -155,6 +174,7 @@ wait_for_new() { # file-of-addresses-before timeout_s  -> prints the new address
 }
 
 close_ws() {
+  fixture_only_or_die
   local a
   for a in $(clients_on "$WS" | jq -r '.[].address'); do dsp_close "$a"; done
   wait_for_empty
@@ -190,7 +210,7 @@ preflight() {
   log "layout (DEC-C): $(hyprctl getoption general:layout -j | jq -c '{str, int}' 2>/dev/null || hyprctl getoption general:layout | tr '\n' ' ')"
   local opt
   for opt in dwindle:use_active_for_splits dwindle:force_split dwindle:preserve_split dwindle:smart_split dwindle:split_width_multiplier; do
-    log "$opt: $(hyprctl getoption "$opt" -j 2>/dev/null | jq -c '{int, float, str}' 2>/dev/null || echo unavailable)"
+    log "$opt: $(hyprctl getoption "$opt" -j 2>/dev/null | jq -c '{int, float, str}' 2>/dev/null || echo unavailable)   [plain: $(hyprctl getoption "$opt" 2>&1 | tr '\n' ' ')]"
   done
   log "workspace rules: $(hyprctl workspacerules -j 2>/dev/null | jq -c '.' 2>/dev/null || echo unavailable)"
   detect_dialect; log "dispatch dialect: $DIALECT"
@@ -230,6 +250,8 @@ build() {
 
 baseline() {
   [ -f "$SESS/spike-a/clients.json" ] || die "run build first"
+  need hyprctl; need jq
+  fixture_only_or_die   # the scoped loads below close everything on the scratch workspace
   log "== baseline: current code, save A -> load A -> save B -> load B -> save C"
   load spike-a;  dump_ws "after load A";  save spike-b
   load spike-b;  dump_ws "after load B";  save spike-c
@@ -338,7 +360,11 @@ preflight_light() {
 
 cleanup() {
   need hyprctl; need jq
-  if [ -d "$DIR" ]; then close_ws 2>/dev/null || true; fi
+  # close only this script's fixture windows on the scratch workspace, never anything else
+  local pid a
+  if [ -d "$DIR" ]; then
+    for a in $(clients_on "$WS" | jq -r '.[] | "\(.pid) \(.address)"' | while read -r pid a; do is_fixture "$pid" && echo "$a"; done); do dsp_close "$a"; done
+  fi
   if [ "${KEEP:-0}" = 1 ]; then log "kept $DIR (it contains your real window titles)"; else rm -rf "$DIR"; echo "removed $DIR" >&2; fi
 }
 
@@ -349,6 +375,229 @@ all() {
   log "== done. Paste $REPORT back (it lists no window titles, only fixture directories)."
 }
 
+# ================================================================ spike #2
+# Pin the split-target rule, then test computed insertion orders. Nothing here uses hyprsession's
+# loader: windows are launched (they land on the visible workspace), held, and moved onto the
+# scratch workspace one at a time, exactly as the ordered-placement prototype does.
+
+ptr() { hyprctl cursorpos -j 2>/dev/null | jq -r '"\(.x),\(.y)"' 2>/dev/null || echo "?"; }
+active_win() { hyprctl activewindow -j 2>/dev/null | jq -r 'if .address then "\(.address)@\(.workspace.id)" else "none" end' 2>/dev/null || echo "?"; }
+near() { awk -v g="$1" -v w="$2" 'BEGIN{split(g,a,",");split(w,b,",");dx=a[1]-b[1];dy=a[2]-b[2];exit !(dx*dx+dy*dy<=25)}'; }
+
+# Quarter points of the focused monitor: TL TR BL BR, and C for the centre
+pointer_target() { # name -> "x y"
+  hyprctl monitors -j | jq -r --arg a "$1" '.[] | select(.focused) |
+    (.x) as $x | (.y) as $y | (.width) as $w | (.height) as $h |
+    ({"TL":[0.25,0.25],"TR":[0.75,0.25],"BL":[0.25,0.75],"BR":[0.75,0.75],"C":[0.5,0.5]}[$a]) as $f |
+    "\(($x + $w * $f[0]) | floor) \(($y + $h * $f[1]) | floor)"'
+}
+
+warp_pointer() { # x y -> success if the pointer is now there
+  detect_dialect
+  if [ "$DIALECT" = classic ]; then hyprctl dispatch movecursor "$1 $2" >/dev/null 2>&1 || true
+  else hyprctl dispatch "hl.dsp.cursor.move({ x = $1, y = $2 })" >/dev/null 2>&1 || true; fi
+  sleep 0.2
+  near "$(ptr)" "$1,$2"
+}
+
+park_pointer() { # TL|TR|BL|BR|C
+  [ "$POINTER_MODE" = ignore ] && { log "  pointer: left where it is ($(ptr))"; return 0; }
+  local xy x y how=manual
+  xy="$(pointer_target "$1")"; x="${xy% *}"; y="${xy#* }"
+  if [ "$POINTER_MODE" = auto ] && warp_pointer "$x" "$y"; then how="warped ($DIALECT dialect)"
+  else
+    printf 'spike: put the mouse pointer in the %s part of the screen (around %s,%s), then press Enter ' "$1" "$x" "$y" >&2
+    read -r _ </dev/tty || true
+  fi
+  log "  pointer parked at $1 target $x,$y -> now $(ptr) [$how]"
+}
+
+table_tsv() { # tag x y w h for every window on the scratch workspace
+  local pid x y w h
+  clients_on "$WS" | jq -r '.[] | "\(.pid)\t\(.at[0])\t\(.at[1])\t\(.size[0])\t\(.size[1])"' |
+    while IFS=$'\t' read -r pid x y w h; do printf '%s\t%s\t%s\t%s\t%s\n' "$(tag "$pid")" "$x" "$y" "$w" "$h"; done
+}
+
+# Insert N fixture windows (d1..dN) onto the scratch workspace one at a time, in ORDER (fixture
+# numbers), recording the window table, pointer and active window around every move.
+# The windows are launched first, in ARRIVAL order, and held on the visible workspace
+# (or on special:spike-stage when STAGE=1).
+probe_run() { # label n "order" [arrival] [stage]
+  local label="$1" n="$2" order="$3" arrival="${4:-forward}" stage="${5:-0}"
+  local rd="$RUNS/$label" k a step=0 start_ws discounted="" before="$DIR/before.txt"
+  rm -rf "$rd"; mkdir -p "$rd" "$DIR/cwd"
+  close_ws
+  for k in $(seq 1 "$n"); do mkdir -p "$DIR/cwd/d$k"; done
+  start_ws="$(active_ws)"
+  declare -A addr_of=()
+  local launch
+  if [ "$arrival" = reverse ]; then launch="$(seq "$n" -1 1)"; else launch="$(seq 1 "$n")"; fi
+  for k in $launch; do
+    all_addresses >"$before"
+    dsp_exec "foot --working-directory=$DIR/cwd/d$k"
+    a="$(wait_for_new "$before" 20)" || die "foot d$k did not appear"
+    addr_of[$k]="$a"
+    [ "$stage" = 1 ] && dsp_move "$a" "special:spike-stage"
+    sleep 0.3
+  done
+  # the held windows must not be on the scratch workspace yet, and the visible workspace must not have moved
+  [ "$(clients_on "$WS" | jq 'length')" -eq 0 ] || discounted="windows landed directly on workspace $WS"
+  [ "$(active_ws)" = "$start_ws" ] || discounted="visible workspace changed during launch"
+  [ -z "$discounted" ] || log "  !! run $label discounted: $discounted"
+  local pointers=() tags=() p
+  for k in $order; do
+    step=$((step + 1))
+    p="$(ptr)"
+    [ "$step" -ge 2 ] && pointers+=("$p")
+    log "  [$label] step $step: insert d$k  pointer=$p  active=$(active_win)"
+    dsp_move "${addr_of[$k]}" "$WS"
+    sleep "$STEP_PAUSE"
+    table_tsv >"$rd/t$step.tsv"
+    tags+=("d$k")
+  done
+  jq -n --arg label "$label" --arg arrival "$arrival" --argjson stage "$stage" --arg discounted "$discounted" \
+        --arg order "${tags[*]}" --arg pointers "${pointers[*]:-}" '
+    {label: $label, arrival: $arrival, stage: $stage, order: ($order | split(" ")),
+     pointers: ($pointers | split(" ") | map(select(. != "?") | split(",") | map(tonumber)))}
+    + (if $discounted != "" then {discounted: true, reason: $discounted} else {} end)' >"$rd/meta.json"
+  python3 "$MODEL" derive "$rd" | tee -a "$REPORT" >&2
+  unset addr_of
+}
+
+rule_runs() {
+  need hyprctl; need jq; need python3; need foot
+  [ -x "$BIN" ] || die "hyprsession binary not found"
+  mkdir -p "$DIR" "$SESS" "$RUNS"
+  preflight_light
+}
+
+# Spike #2 part A: pin the rule with targeted fixtures
+rule() {
+  rule_runs
+  : >"$REPORT"; : >"$RUNS/rule.jsonl"
+  log "== rule ($(date -Is)); hyprland $(hyprctl version -j | jq -r '.tag // .version'); step pause $STEP_PAUSE s; pointer mode $POINTER_MODE"
+  log "monitors: $(hyprctl monitors -j | jq -c '[.[] | {name, x, y, width, height, focused}]')"
+  local area rep arr st n
+  log "-- Block P: pointer matrix (5 windows, forward arrival, inserted 1..5)"
+  for area in BL TR TL BR C; do park_pointer "$area"; probe_run "P-$area" 5 "1 2 3 4 5"; done
+  log "-- Block A: arrival x staging at a fixed pointer, two repeats (the spike #1 anomaly cell is reverse/stage 1)"
+  park_pointer BL
+  for rep in 1 2; do for arr in forward reverse; do for st in 0 1; do
+    probe_run "A-$arr-s$st-r$rep" 5 "1 2 3 4 5" "$arr" "$st"
+  done; done; done
+  log "-- Block N: window count 2,3,4,6 at two pointer areas"
+  for area in BL TR; do park_pointer "$area"; for n in 2 3 4 6; do probe_run "N-$area-$n" "$n" "$(seq -s' ' 1 "$n")"; done; done
+  log "-- Block R: repeatability (identical runs, pointer untouched)"
+  park_pointer BL
+  for rep in 1 2 3; do probe_run "R-BL-$rep" 4 "1 2 3 4"; done
+  log "-- Block O: permuted insertion order (identities differ, count equal)"
+  probe_run "O-perm" 5 "3 1 5 2 4"
+  log "== hypothesis scores (a rule is confirmed when it matches every non-discounted run)"
+  python3 "$MODEL" score "$RUNS/rule.jsonl" | tee -a "$REPORT" >&2
+  python3 "$MODEL" score "$RUNS/rule.jsonl" | sed -n 's/^BEST //p' >"$DIR/rule.best"
+  log "== rule done. Paste $REPORT and $RUNS/rule.jsonl back."
+}
+
+# A tiled shape built by insertion (reachable under the measured rule at the current pointer)
+shape_insert() { # name n
+  rule_runs
+  local name="$1" n="$2"
+  park_pointer BL
+  probe_run "shape-$name" "$n" "$(seq -s' ' 1 "$n")"
+  save "shape-$name"
+  log "shape $name: $n windows built by insertion, saved as shape-$name"
+}
+
+# A tiled shape arranged by hand on the VISIBLE scratch workspace (any keybinds), as a real desk grows
+shape_hand() { # name n
+  need hyprctl; need jq; need foot
+  local name="$1" n="$2" k before="$DIR/before.txt"
+  mkdir -p "$DIR" "$SESS" "$RUNS" "$DIR/cwd"
+  [ "$(active_ws)" = "$WS" ] || die "switch to workspace $WS (empty) first: this shape is arranged by hand on it"
+  [ "$(clients_on "$WS" | jq 'length')" -eq 0 ] || die "workspace $WS must be empty"
+  for k in $(seq 1 "$n"); do
+    mkdir -p "$DIR/cwd/d$k"
+    all_addresses >"$before"; dsp_exec "foot --working-directory=$DIR/cwd/d$k"
+    wait_for_new "$before" 20 >/dev/null || die "foot d$k did not appear"
+    sleep 0.3
+  done
+  printf 'spike: %s foot windows are on workspace %s. Arrange them into the layout you want to test\n' "$n" "$WS" >&2
+  printf '       (focus, move, resize with your usual keys; keep them tiled). Press Enter when done ' >&2
+  read -r _ </dev/tty || true
+  save "shape-$name"
+  dump_ws "hand-built shape $name"
+  printf 'spike: now switch to an EMPTY workspace other than %s, then press Enter ' "$WS" >&2
+  read -r _ </dev/tty || true
+}
+
+# Computed insertion order for snapshot shape-NAME, prototyped outside hyprsession.
+# MODE plain: the pointer is left where it is (what a real load would find).
+# MODE steer: the pointer is warped inside the target leaf before every move (needs SPIKE_ALLOW_POINTER=1).
+computed() { # name [plain|steer]
+  rule_runs
+  local name="$1" mode="${2:-plain}" src="shape-$1" rule order_file="$DIR/order-$1-${2:-plain}.txt" dst="computed-$1-${2:-plain}"
+  [ -f "$SESS/$src/clients.json" ] || die "no snapshot $src (use shape-insert / shape-hand)"
+  rule="${SPIKE_RULE:-$(cat "$DIR/rule.best" 2>/dev/null || echo pointer)}"
+  if [ "$mode" = steer ]; then
+    [ "$ALLOW_POINTER" = 1 ] || die "steer moves your mouse pointer; set SPIKE_ALLOW_POINTER=1"
+    python3 "$MODEL" steer "$SESS/$src/clients.json" "$WS" >"$order_file" || true
+  else
+    python3 "$MODEL" order "$SESS/$src/clients.json" "$WS" "$rule" --pointer "$(ptr)" >"$order_file" || true
+  fi
+  log "== computed[$name,$mode] rule=$rule pointer=$(ptr): $(head -1 "$order_file")"
+  local lines=() targets=() line
+  mapfile -t lines < <(grep -v -e '^MODE' -e '^POINTER' "$order_file")
+  mapfile -t targets < <(grep '^POINTER' "$order_file" | sed 's/^POINTER //')
+  [ "${#lines[@]}" -gt 0 ] || die "empty order for $name"
+  close_ws
+  local before="$DIR/before.txt" addrs=() line a i step=0
+  for line in "${lines[@]}"; do
+    all_addresses >"$before"; dsp_exec "${line#* * }"
+    a="$(wait_for_new "$before" 20)" || die "window for '${line#* * }' did not appear"
+    addrs+=("$a"); sleep 0.3
+  done
+  for i in "${!lines[@]}"; do
+    if [ "$mode" = steer ] && [ "$i" -ge 1 ]; then
+      local t="${targets[$((i - 1))]}"
+      warp_pointer "${t% *}" "${t#* }" || log "  !! could not warp the pointer to $t"
+    fi
+    dsp_move "${addrs[$i]}" "$WS"; sleep "$STEP_PAUSE"
+    dump_ws "after inserting #$((i + 1)) (${lines[$i]#* * }) pointer=$(ptr)"
+  done
+  sleep 1; save "$dst"
+  local d; d="$(diff_report "$SESS/$src/clients.json" "$SESS/$dst/clients.json" "$WS")"
+  if [ "$d" = EMPTY ]; then log "RESULT computed[$name,$mode]: PASS (first-cycle diff EMPTY)"
+  else log "RESULT computed[$name,$mode]: FAIL — diff(saved, reproduced):"; printf '%s\n' "$d" | sed 's/^/     /' | tee -a "$REPORT" >&2; fi
+}
+
+# The pre-stated success bar: first-cycle diff EMPTY for each of these shapes.
+bar() {
+  rule_runs
+  log "== bar: shapes s4 (the spike #1 shape), s3r (3-window, full-height RIGHT), s5, s6 built by insertion;"
+  log "   s3l (3-window, full-height LEFT: the ws4/ws7 pattern) and h5 (5 windows) arranged by hand"
+  local name n
+  for spec in "s4 4" "s3r 3" "s5 5" "s6 6"; do
+    name="${spec% *}"; n="${spec#* }"
+    shape_insert "$name" "$n"
+    park_pointer BL
+    computed "$name" plain
+    [ "$ALLOW_POINTER" = 1 ] && computed "$name" steer
+  done
+  log "-- hand-built shapes: you will be asked to arrange windows on workspace $WS (visible), then switch away"
+  log "   s3l: one window full-height on the LEFT, two stacked on the RIGHT"
+  shape_hand s3l 3
+  park_pointer BL; computed s3l plain; [ "$ALLOW_POINTER" = 1 ] && computed s3l steer
+  log "   h5: any 5-window layout you actually use"
+  [ "$(active_ws)" = "$WS" ] || log "   (switch to workspace $WS, empty, for the next hand-built shape)"
+  printf 'spike: switch to workspace %s (empty), then press Enter ' "$WS" >&2; read -r _ </dev/tty || true
+  shape_hand h5 5
+  park_pointer BL; computed h5 plain; [ "$ALLOW_POINTER" = 1 ] && computed h5 steer
+  log "== bar summary"
+  grep -E '^RESULT' "$REPORT" | tee -a "$REPORT.summary" >&2 || true
+}
+
+spike2() { rule; bar; }
+
 case "${1:-}" in
   preflight) need hyprctl; mkdir -p "$DIR" "$SESS"; : >"$REPORT"; preflight ;;
   build) build ;;
@@ -357,7 +606,13 @@ case "${1:-}" in
   proto-focus) proto_focus ;;
   export-fixture) export_fixture "${2:-spike-a}" "${3:?usage: export-fixture SNAPSHOT OUT.json}" ;;
   all) all ;;
+  rule) rule ;;
+  shape-insert) shape_insert "${2:?name}" "${3:?n}" ;;
+  shape-hand) shape_hand "${2:?name}" "${3:?n}" ;;
+  computed) computed "${2:?name}" "${3:-plain}" ;;
+  bar) bar ;;
+  spike2) spike2 ;;
   cleanup) cleanup ;;
   selftest) selftest ;;
-  *) sed -n '2,20p' "$0"; exit 2 ;;
+  *) sed -n '2,24p' "$0"; exit 2 ;;
 esac
