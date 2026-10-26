@@ -29,6 +29,10 @@ pub fn fake_command(name: &str, command: &str) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+/// Tokens a Flatpak export's Exec line carries for the launching desktop environment
+/// (`flatpak run ... @@u %U @@`); they are never valid in a shell command line
+const LAUNCHER_MARKERS: [&str; 3] = ["@@", "@@u", "@@f"];
+
 /// Parse a .desktop file and extract the application name and command
 fn parse_desktop_file(path: &PathBuf) -> Option<(String, String)> {
     let content = fs::read_to_string(path).ok()?;
@@ -57,7 +61,7 @@ fn parse_desktop_file(path: &PathBuf) -> Option<(String, String)> {
             // Remove field codes like %f, %F, %u, %U, etc.
             let cleaned = value
                 .split_whitespace()
-                .filter(|s| !s.starts_with('%'))
+                .filter(|s| !s.starts_with('%') && !LAUNCHER_MARKERS.contains(s))
                 .collect::<Vec<_>>()
                 .join(" ");
             exec = Some(cleaned);
@@ -86,6 +90,10 @@ fn get_desktop_file_dirs() -> Vec<PathBuf> {
         dirs.push(PathBuf::from(home).join(".local/share/applications"));
     }
     
+    let user_data = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+
     // System directories
     if let Ok(data_dirs) = std::env::var("XDG_DATA_DIRS") {
         for dir in data_dirs.split(':') {
@@ -99,6 +107,24 @@ fn get_desktop_file_dirs() -> Vec<PathBuf> {
         dirs.push(PathBuf::from("/usr/share/applications"));
     }
     
+    // Flatpak's exported entries, last so user and system entries win. They are only on
+    // XDG_DATA_DIRS when the environment happens to include them.
+    for dir in flatpak_export_dirs(user_data.ok().as_deref()) {
+        if dir.exists() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+
+    dirs
+}
+
+/// Where Flatpak exports desktop entries: the user installation, then the system one
+fn flatpak_export_dirs(user_data_home: Option<&std::path::Path>) -> Vec<PathBuf> {
+    let mut dirs = vec![];
+    if let Some(data_home) = user_data_home {
+        dirs.push(data_home.join("flatpak/exports/share/applications"));
+    }
+    dirs.push(PathBuf::from("/var/lib/flatpak/exports/share/applications"));
     dirs
 }
 
@@ -242,5 +268,43 @@ Icon=test-icon
         let map = build_xdg_command_map_from(&[dir.path().to_path_buf()]);
         assert_eq!(map.get("b").map(String::as_str), Some("one"));
         assert_eq!(map.get(&xdg_id_key("A")).map(String::as_str), Some("one"));
+    }
+
+    #[test]
+    fn test_flatpak_export_entry_resolves_with_markers_stripped() {
+        let user = tempfile::tempdir().unwrap();
+        let export = tempfile::tempdir().unwrap();
+        fs::write(
+            export.path().join("dev.vencord.Vesktop.desktop"),
+            "[Desktop Entry]\nName=Vesktop\nExec=/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=vesktop --file-forwarding dev.vencord.Vesktop @@u %U @@\n",
+        ).unwrap();
+        // A user entry and an export entry with the same id: the user one wins
+        fs::write(user.path().join("org.example.App.desktop"), "[Desktop Entry]\nName=App\nExec=user-app\n").unwrap();
+        fs::write(export.path().join("org.example.App.desktop"), "[Desktop Entry]\nName=App\nExec=export-app @@f %f @@\n").unwrap();
+
+        let map = build_xdg_command_map_from(&[user.path().to_path_buf(), export.path().to_path_buf()]);
+        assert_eq!(
+            map.get(&xdg_id_key("dev.vencord.vesktop")).map(String::as_str),
+            Some("/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=vesktop --file-forwarding dev.vencord.Vesktop")
+        );
+        assert_eq!(map.get(&xdg_id_key("org.example.app")).map(String::as_str), Some("user-app"));
+        assert_eq!(map.get("app").map(String::as_str), Some("user-app"));
+    }
+
+    #[test]
+    fn test_launcher_markers_are_dropped_from_exec() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), "[Desktop Entry]\nName=X\nExec=run x @@u %U @@ @@f --keep\n").unwrap();
+        let (_, command) = parse_desktop_file(&file.path().to_path_buf()).unwrap();
+        assert_eq!(command, "run x --keep");
+    }
+
+    #[test]
+    fn test_flatpak_export_dirs_are_user_then_system() {
+        let dirs = flatpak_export_dirs(Some(std::path::Path::new("/home/u/.local/share")));
+        assert_eq!(dirs, vec![
+            PathBuf::from("/home/u/.local/share/flatpak/exports/share/applications"),
+            PathBuf::from("/var/lib/flatpak/exports/share/applications"),
+        ]);
     }
 }
