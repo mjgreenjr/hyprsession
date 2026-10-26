@@ -30,6 +30,8 @@ pub fn parse_stat(text: &str) -> Option<ProcStat> {
 }
 
 pub trait ProcFs {
+    /// The pid of the process doing the capturing
+    fn own_pid(&self) -> i32;
     fn pids(&self) -> Vec<i32>;
     fn stat(&self, pid: i32) -> Option<ProcStat>;
     fn argv(&self, pid: i32) -> Option<Vec<String>>;
@@ -41,6 +43,10 @@ pub trait ProcFs {
 pub struct RealProc;
 
 impl ProcFs for RealProc {
+    fn own_pid(&self) -> i32 {
+        std::process::id() as i32
+    }
+
     fn pids(&self) -> Vec<i32> {
         fs::read_dir("/proc")
             .map(|dir| {
@@ -185,12 +191,19 @@ pub fn capture_terminal(proc: &dyn ProcFs, table: &ProcTable, terminal_pid: i32)
         Some(&pid) => pid,
         None => return capture,
     } };
+    // When hyprsession itself was run from the terminal (`hyprsession save`), it is the
+    // terminal's foreground job. That is not a program to bring back: treat the shell as foreground.
+    let descendants = table.descendants(leader);
+    let own = proc.own_pid();
+    if group.contains(&own) || descendants.contains(&own) {
+        return capture;
+    }
     let Some(argv) = proc.argv(leader) else { return capture };
     capture.foreground = Some(ForegroundCapture {
         pid: leader,
         argv,
         cwd: proc.cwd(leader),
-        descendant_pids: table.descendants(leader),
+        descendant_pids: descendants,
         group_pids: group,
     });
     capture
@@ -204,6 +217,8 @@ pub mod fake {
     #[derive(Default)]
     pub struct FakeProc {
         pub procs: HashMap<i32, FakeEntry>,
+        /// The pid the capture claims to be running as (0: none of the fake processes)
+        pub own: i32,
     }
 
     #[derive(Clone)]
@@ -224,6 +239,7 @@ pub mod fake {
     }
 
     impl ProcFs for FakeProc {
+        fn own_pid(&self) -> i32 { self.own }
         fn pids(&self) -> Vec<i32> { self.procs.keys().copied().collect() }
         fn stat(&self, pid: i32) -> Option<ProcStat> { self.procs.get(&pid).map(|p| p.stat) }
         fn argv(&self, pid: i32) -> Option<Vec<String>> {
@@ -326,6 +342,50 @@ mod tests {
         let c = capture(&p, 100);
         assert_eq!(c.foreground, None);
         assert!(c.shell_cwd.is_some());
+    }
+
+    #[test]
+    fn test_the_capturing_process_as_foreground_leader_records_nothing() {
+        // `hyprsession save` run from the terminal is the terminal's foreground job
+        let mut p = terminal_with_shell();
+        run_in_foreground(&mut p, 200, &["hyprsession", "save"], "/home/synthetic/proj");
+        p.own = 200;
+        let c = capture(&p, 100);
+        assert_eq!(c.foreground, None);
+        // The shell's cwd is still recorded
+        assert_eq!(c.shell_cwd.as_deref(), Some("/home/synthetic/shell-dir"));
+    }
+
+    #[test]
+    fn test_the_capturing_process_below_a_wrapper_leader_records_nothing() {
+        // e.g. `cargo run -- save`: the leader is a wrapper, hyprsession is its descendant
+        let mut p = terminal_with_shell();
+        run_in_foreground(&mut p, 200, &["cargo", "run"], "/home/synthetic/proj");
+        p.add(201, 200, 201, 101, 5, 200, &["hyprsession", "save"], "/home/synthetic/proj");
+        p.own = 201;
+        let c = capture(&p, 100);
+        assert_eq!(c.foreground, None);
+        assert!(c.shell_cwd.is_some());
+    }
+
+    #[test]
+    fn test_the_capturing_process_elsewhere_in_the_foreground_group_records_nothing() {
+        let mut p = terminal_with_shell();
+        run_in_foreground(&mut p, 200, &["sh", "-c", "hyprsession save | tee log"], "/tmp");
+        p.add(202, 101, 200, 101, 5, 200, &["hyprsession", "save"], "/tmp");
+        p.own = 202;
+        assert_eq!(capture(&p, 100).foreground, None);
+    }
+
+    #[test]
+    fn test_an_unrelated_foreground_program_is_still_recorded_when_saving_elsewhere() {
+        let mut p = terminal_with_shell();
+        run_in_foreground(&mut p, 200, &["claude"], "/home/synthetic/proj");
+        // hyprsession runs as a daemon outside this terminal
+        p.add(900, 1, 900, 900, 0, -1, &["hyprsession"], "/");
+        p.own = 900;
+        let fg = capture(&p, 100).foreground.unwrap();
+        assert_eq!(fg.argv, vec!["claude"]);
     }
 
     #[test]

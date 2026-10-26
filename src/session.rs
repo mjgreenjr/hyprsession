@@ -892,6 +892,16 @@ mod tests {
     }
 
     #[test]
+    fn test_saving_from_a_terminal_does_not_record_the_save_command_as_its_foreground() {
+        let mut p = terminal_with_shell();
+        run_in_foreground(&mut p, 200, &["hyprsession", "save"], "/home/synthetic/proj");
+        p.own = 200;
+        let saved = capture(&p, &[terminal_window(100, 1)]);
+        assert!(saved[0].foreground.is_none());
+        assert_eq!(saved[0].cwd.as_deref(), Some("/home/synthetic/shell-dir"));
+    }
+
+    #[test]
     fn test_non_terminal_windows_get_no_foreground_and_keep_their_cwd() {
         let mut p = terminal_with_shell();
         p.add(900, 1, 900, 900, 0, -1, &["/usr/bin/mpv"], "/home/synthetic/videos");
