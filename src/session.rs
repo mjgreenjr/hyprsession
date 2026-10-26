@@ -45,8 +45,22 @@ pub struct SavedClient {
     pub client: Client,
     /// Process argv, split from the raw /proc/<pid>/cmdline
     pub argv: Option<Vec<String>>,
-    /// Process working directory (recorded only; not used when loading)
+    /// Process working directory, the directory the window is launched from on load
     pub cwd: Option<String>,
+    /// For terminal windows: the program running in the foreground of the terminal's tty
+    pub foreground: Option<Foreground>,
+}
+
+/// The non-shell program that was in the foreground of a terminal when it was saved
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Foreground {
+    /// Pid of the foreground process group leader at save time
+    pub pid: i32,
+    pub argv: Vec<String>,
+    pub cwd: Option<String>,
+    /// The program owns another saved client's window (by pid): relaunch nothing in the terminal
+    #[serde(default)]
+    pub linked: bool,
 }
 
 // The client fields and the extras share one JSON object. serde's flatten can't be
@@ -61,6 +75,9 @@ impl From<SavedClient> for serde_json::Value {
         if let Some(cwd) = saved.cwd {
             object.insert("cwd".to_string(), serde_json::json!(cwd));
         }
+        if let Some(foreground) = saved.foreground {
+            object.insert("foreground".to_string(), serde_json::json!(foreground));
+        }
         value
     }
 }
@@ -70,14 +87,15 @@ impl TryFrom<serde_json::Value> for SavedClient {
 
     fn try_from(mut value: serde_json::Value) -> Result<Self, Self::Error> {
         // Both extras are optional: snapshots from before they existed lack them
-        let (argv, cwd) = match value.as_object_mut() {
+        let (argv, cwd, foreground) = match value.as_object_mut() {
             Some(object) => (
                 object.remove("argv").and_then(|v| serde_json::from_value(v).ok()),
                 object.remove("cwd").and_then(|v| serde_json::from_value(v).ok()),
+                object.remove("foreground").and_then(|v| serde_json::from_value(v).ok()),
             ),
-            None => (None, None),
+            None => (None, None, None),
         };
-        Ok(SavedClient { client: serde_json::from_value(value)?, argv, cwd })
+        Ok(SavedClient { client: serde_json::from_value(value)?, argv, cwd, foreground })
     }
 }
 
@@ -87,6 +105,7 @@ impl SavedClient {
             client: client.clone(),
             argv: read_argv(client.pid),
             cwd: read_cwd(client.pid),
+            foreground: None,
         }
     }
 }
@@ -239,6 +258,7 @@ impl LocalSession {
             saved: if place_by_class { saved.into_iter().map(|c| c.client).collect() } else { vec![] },
             place_by_class,
             tail_ticks: LoadPlan::tail_ticks_for(self.load_time),
+            scope: None,
             restore_workspace: if self.simulate { None } else { Workspace::get_active().ok().map(|w| w.id) },
         })
     }
@@ -416,6 +436,7 @@ mod tests {
             client: client("brave", "tab", 2, false, (0, 0), (10, 10)),
             argv: Some(vec!["brave".into(), "--user-data-dir=/x y".into()]),
             cwd: Some("/home/synthetic".into()),
+            foreground: None,
         };
         let json = serde_json::to_string(&vec![saved.clone()]).unwrap();
         let back: Vec<SavedClient> = serde_json::from_str(&json).unwrap();
@@ -447,6 +468,7 @@ mod tests {
             client: client(class, "t", ws, false, at, (10, 10)),
             argv: Some(argv.iter().map(|s| s.to_string()).collect()),
             cwd: None,
+            foreground: None,
         }
     }
 
@@ -497,7 +519,7 @@ mod tests {
         std::fs::write(dir.path().join(EXEC_NAME), exec).unwrap();
         // Old-format clients.json: windows but no argv anywhere
         write_clients(dir.path(), &[
-            SavedClient { client: client("kitty", "t", 2, true, (5, 6), (7, 8)), argv: None, cwd: None },
+            SavedClient { client: client("kitty", "t", 2, true, (5, 6), (7, 8)), argv: None, cwd: None, foreground: None },
         ]);
         let plan = sim_session(dir.path()).prepare_load(dir.path()).unwrap();
         assert!(!plan.place_by_class);
@@ -512,7 +534,7 @@ mod tests {
         let saved = |class: &str, at: (i16, i16), pid: i32| {
             let mut client = client(class, "t", 1, false, at, (10, 10));
             client.pid = pid;
-            SavedClient { client, argv: Some(vec![class.to_string()]), cwd: None }
+            SavedClient { client, argv: Some(vec![class.to_string()]), cwd: None, foreground: None }
         };
         let before = vec![saved("brave", (0, 0), 10), saved("brave", (5, 0), 10), saved("kitty", (9, 9), 20)];
         // After a reload: new pids, new addresses, different order
@@ -544,6 +566,7 @@ mod tests {
                 client: client("brave", &format!("w{i}"), 1, false, (i, 0), (10, 10)),
                 argv: Some(vec!["brave".into()]),
                 cwd: None,
+                foreground: None,
             })
             .collect();
         // Three windows of one process: one launch line, three saved windows

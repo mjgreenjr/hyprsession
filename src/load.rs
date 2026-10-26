@@ -42,6 +42,17 @@ pub struct ExecEntry {
     pub rules: ExecRules,
     /// The bare command, with the `[rules]` prefix removed
     pub command: String,
+    /// The saved windows this launch is responsible for (new-format snapshots only)
+    pub group: Option<GroupInfo>,
+}
+
+/// What a launch is expected to produce
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupInfo {
+    /// The recorded command, for reports
+    pub label: String,
+    /// Indices into `LoadPlan::saved` of the windows of this launch's process
+    pub saved: Vec<usize>,
 }
 
 fn two_numbers(rule: &str, rest: &[&str]) -> Result<(i16, i16), String> {
@@ -108,11 +119,11 @@ pub fn parse_exec_line(line: &str) -> Result<ExecEntry, String> {
         if command.is_empty() {
             return Err(format!("no command in line: {line}"));
         }
-        Ok(ExecEntry { rules: parse_rules(rules)?, command: command.to_string() })
+        Ok(ExecEntry { rules: parse_rules(rules)?, command: command.to_string(), group: None })
     } else if line.is_empty() {
         Err("empty line".to_string())
     } else {
-        Ok(ExecEntry { rules: ExecRules::default(), command: line.to_string() })
+        Ok(ExecEntry { rules: ExecRules::default(), command: line.to_string(), group: None })
     }
 }
 
@@ -196,7 +207,7 @@ pub fn launch_entries_from_saved(saved: &[SavedClient], xdg_map: &HashMap<String
             .or_insert_with(|| rules_from_client(&window.client))
             .clone();
         if launched.insert((command.clone(), window.client.pid)) {
-            entries.push(ExecEntry { rules, command });
+            entries.push(ExecEntry { rules, command, group: None });
         }
     }
     entries
@@ -335,6 +346,8 @@ pub struct LoadPlan {
     pub place_by_class: bool,
     /// Polls to keep placing after the last launch
     pub tail_ticks: u64,
+    /// Only this workspace's slice is being loaded
+    pub scope: Option<i32>,
     /// Workspace to focus once finished
     pub restore_workspace: Option<i32>,
 }
@@ -639,6 +652,7 @@ mod tests {
             client: client(class, "t", ws, floating, at, (100, 50)),
             argv: argv.map(|a| a.iter().map(|s| s.to_string()).collect()),
             cwd: Some("/home/synthetic".to_string()),
+            foreground: None,
         }
     }
 
@@ -871,6 +885,7 @@ mod tests {
             saved: vec![],
             place_by_class: false,
             tail_ticks: 0,
+            scope: None,
             restore_workspace: Some(7),
         };
         let report = run_load(&host, &plan);
@@ -903,6 +918,7 @@ mod tests {
             saved,
             place_by_class: true,
             tail_ticks: 10,
+            scope: None,
             restore_workspace: None,
         };
         let report = run_load(&host, &plan);
@@ -919,6 +935,7 @@ mod tests {
             saved: vec![client("kitty", "t", 1, false, (0, 0), (1, 1))],
             place_by_class: true,
             tail_ticks: 600,
+            scope: None,
             restore_workspace: None,
         };
         let report = run_load(&host, &plan);
@@ -935,6 +952,7 @@ mod tests {
             saved: vec![client("kitty", "t", 2, false, (0, 0), (1, 1))],
             place_by_class: true,
             tail_ticks: 5,
+            scope: None,
             restore_workspace: None,
         };
         let report = run_load(&host, &plan);
@@ -950,6 +968,7 @@ mod tests {
             saved: vec![],
             place_by_class: false,
             tail_ticks: 0,
+            scope: None,
             restore_workspace: None,
         };
         let report = run_load(&host, &plan);
