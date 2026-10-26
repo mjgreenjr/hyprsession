@@ -5,11 +5,12 @@
 //! tested against a fake one.
 
 use crate::dispatch::{Dispatcher, Op};
-use crate::command_detection::{resolve_desktop_command, shell_join};
+use crate::command_detection::{resolve_desktop_command, shell_join, shell_quote};
 use crate::session::{plan_adjustment, SavedClient};
 use hyprland::data::{Client, Clients, FullscreenMode, Workspace};
 use hyprland::shared::{Address, HyprData, HyprDataActive};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 /// Polls per second while waiting for windows
 const TICKS_PER_SECOND: u64 = 4;
@@ -187,13 +188,38 @@ fn is_sandbox_internal(argv: &[String]) -> bool {
 /// cannot be launched and are skipped (they are still placed if their app brings them
 /// up).
 pub fn launch_entries_from_saved(saved: &[SavedClient], xdg_map: &HashMap<String, String>) -> Vec<ExecEntry> {
+    launch_entries_with(saved, xdg_map, &|dir| dir.is_dir())
+}
+
+/// Prefix a launch with `cd <cwd> &&` so it runs from its recorded directory. A
+/// directory that no longer exists leaves the launch unwrapped, with a warning.
+pub fn wrap_cwd(command: String, cwd: Option<&str>, window: &Client, dir_exists: &dyn Fn(&Path) -> bool) -> String {
+    let Some(dir) = cwd else { return command };
+    if dir_exists(Path::new(dir)) {
+        format!("cd {} && {}", shell_quote(dir), command)
+    } else {
+        println!(
+            "Warning: working directory '{dir}' of '{}' ({}) no longer exists; launching from the loader's directory",
+            window.title, window.class
+        );
+        command
+    }
+}
+
+/// `launch_entries_from_saved` with the directory check injected
+pub fn launch_entries_with(
+    saved: &[SavedClient],
+    xdg_map: &HashMap<String, String>,
+    dir_exists: &dyn Fn(&Path) -> bool,
+) -> Vec<ExecEntry> {
     let mut entries: Vec<ExecEntry> = vec![];
     let mut group_rules: HashMap<String, ExecRules> = HashMap::new();
     let mut launched: HashSet<(String, i32)> = HashSet::new();
     for window in saved {
         let Some(argv) = window.argv.as_deref() else { continue };
         let Some(mut command) = command_from_saved_argv(argv) else { continue };
-        if is_sandbox_internal(argv) {
+        let sandboxed = is_sandbox_internal(argv);
+        if sandboxed {
             match resolve_desktop_command(&window.client, xdg_map) {
                 Some(entry_command) => command = entry_command,
                 None => println!(
@@ -207,7 +233,13 @@ pub fn launch_entries_from_saved(saved: &[SavedClient], xdg_map: &HashMap<String
             .or_insert_with(|| rules_from_client(&window.client))
             .clone();
         if launched.insert((command.clone(), window.client.pid)) {
-            entries.push(ExecEntry { rules, command, group: None });
+            // A sandbox's cwd is a path inside the sandbox: not wrapped, not warned about
+            let launch = if sandboxed {
+                command
+            } else {
+                wrap_cwd(command, window.cwd.as_deref(), &window.client, dir_exists)
+            };
+            entries.push(ExecEntry { rules, command: launch, group: None });
         }
     }
     entries
@@ -752,6 +784,82 @@ mod tests {
         // With no desktop entry the recorded command is kept
         let entries = launch_entries_from_saved(&[vesktop], &HashMap::new());
         assert_eq!(entries[0].command, "/app/bin/vesktop/vesktop.bin --no-sandbox");
+    }
+
+    fn saved_cwd(argv: &[&str], pid: i32, cwd: Option<&str>) -> SavedClient {
+        let mut window = saved_pid("app", argv, pid, (0, 0));
+        window.cwd = cwd.map(str::to_string);
+        window
+    }
+
+    #[test]
+    fn test_cwd_wraps_every_launch_with_a_recorded_directory() {
+        let exists = |_: &Path| true;
+        let entries = launch_entries_with(
+            &[
+                // The playcall pattern: a relative-path launch
+                saved_cwd(&["./playcall-gui"], 1, Some("/home/synthetic/Work/playcall-gui")),
+                // Not only relative launches (DEC-1), and paths needing quoting
+                saved_cwd(&["/usr/bin/kitty", "--single-instance"], 2, Some("/home/synthetic/my dir")),
+                // Legacy: no recorded cwd launches exactly as in v1
+                saved_cwd(&["mpv"], 3, None),
+            ],
+            &HashMap::new(),
+            &exists,
+        );
+        let commands: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
+        assert_eq!(commands, vec![
+            "cd /home/synthetic/Work/playcall-gui && ./playcall-gui",
+            "cd '/home/synthetic/my dir' && /usr/bin/kitty --single-instance",
+            "mpv",
+        ]);
+    }
+
+    #[test]
+    fn test_missing_cwd_launches_unwrapped() {
+        let gone = |_: &Path| false;
+        let entries = launch_entries_with(&[saved_cwd(&["./playcall-gui"], 1, Some("/gone"))], &HashMap::new(), &gone);
+        assert_eq!(entries[0].command, "./playcall-gui");
+    }
+
+    #[test]
+    fn test_sandbox_launches_skip_the_cwd_wrap_silently() {
+        let mut xdg = HashMap::new();
+        xdg.insert(
+            crate::command_faker::xdg_id_key("dev.vencord.vesktop"),
+            "/usr/bin/flatpak run dev.vencord.Vesktop".to_string(),
+        );
+        let mut vesktop = saved_cwd(&["/app/bin/vesktop"], 5, Some("/app/some/sandbox/dir"));
+        vesktop.client.initial_class = "dev.vencord.Vesktop".to_string();
+        let exists = |_: &Path| true;
+        let entries = launch_entries_with(&[vesktop], &xdg, &exists);
+        assert_eq!(entries[0].command, "/usr/bin/flatpak run dev.vencord.Vesktop");
+    }
+
+    #[test]
+    fn test_wrapped_relative_launch_runs_from_its_directory() {
+        // Real shell: a relative-path program only runs because of the cd
+        let project = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let script = project.path().join("playcall-gui");
+        std::fs::write(&script, "#!/bin/sh\npwd > ran-from\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let exists = |p: &Path| p.is_dir();
+        let entries = launch_entries_with(
+            &[saved_cwd(&["./playcall-gui"], 1, Some(project.path().to_str().unwrap()))],
+            &HashMap::new(),
+            &exists,
+        );
+        let status = std::process::Command::new("sh")
+            .arg("-c").arg(&entries[0].command).current_dir(elsewhere.path()).status().unwrap();
+        assert!(status.success());
+        let ran_from = std::fs::read_to_string(project.path().join("ran-from")).unwrap();
+        assert_eq!(std::fs::canonicalize(ran_from.trim()).unwrap(), std::fs::canonicalize(project.path()).unwrap());
+
+        // Without the wrap the same launch fails from the loader's directory
+        let bare = std::process::Command::new("sh").arg("-c").arg("./playcall-gui")
+            .current_dir(elsewhere.path()).output().unwrap();
+        assert!(!bare.status.success());
     }
 
     #[test]
