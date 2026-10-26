@@ -16,6 +16,8 @@ use std::path::Path;
 const TICKS_PER_SECOND: u64 = 4;
 /// How long to wait for a launched program to show a window before moving on
 const LAUNCH_WAIT_TICKS: u64 = 20 * TICKS_PER_SECOND;
+/// How long a launch group's window count must hold still before it is considered settled
+const SETTLE_TICKS: u64 = 3 * TICKS_PER_SECOND;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuleWorkspace {
@@ -214,8 +216,8 @@ pub fn launch_entries_with(
 ) -> Vec<ExecEntry> {
     let mut entries: Vec<ExecEntry> = vec![];
     let mut group_rules: HashMap<String, ExecRules> = HashMap::new();
-    let mut launched: HashSet<(String, i32)> = HashSet::new();
-    for window in saved {
+    let mut launched: HashMap<(String, i32), usize> = HashMap::new();
+    for (index, window) in saved.iter().enumerate() {
         let Some(argv) = window.argv.as_deref() else { continue };
         let Some(mut command) = command_from_saved_argv(argv) else { continue };
         let sandboxed = is_sandbox_internal(argv);
@@ -232,14 +234,27 @@ pub fn launch_entries_with(
             .entry(command.clone())
             .or_insert_with(|| rules_from_client(&window.client))
             .clone();
-        if launched.insert((command.clone(), window.client.pid)) {
-            // A sandbox's cwd is a path inside the sandbox: not wrapped, not warned about
-            let launch = if sandboxed {
-                command
-            } else {
-                wrap_cwd(command, window.cwd.as_deref(), &window.client, dir_exists)
-            };
-            entries.push(ExecEntry { rules, command: launch, group: None });
+        match launched.get(&(command.clone(), window.client.pid)) {
+            Some(&entry) => {
+                if let Some(group) = entries[entry].group.as_mut() {
+                    group.saved.push(index);
+                }
+            }
+            None => {
+                launched.insert((command.clone(), window.client.pid), entries.len());
+                let label = command.clone();
+                // A sandbox's cwd is a path inside the sandbox: not wrapped, not warned about
+                let launch = if sandboxed {
+                    command
+                } else {
+                    wrap_cwd(command, window.cwd.as_deref(), &window.client, dir_exists)
+                };
+                entries.push(ExecEntry {
+                    rules,
+                    command: launch,
+                    group: Some(GroupInfo { label, saved: vec![index] }),
+                });
+            }
         }
     }
     entries
@@ -401,6 +416,16 @@ pub struct LoadReport {
     pub unmatched: Vec<Client>,
     /// Live windows no saved client claimed (reported, never touched)
     pub surplus: Vec<Client>,
+    /// Launch groups that produced fewer windows than were saved, even after re-invoking
+    pub shortfalls: Vec<GroupShortfall>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupShortfall {
+    pub label: String,
+    pub expected: usize,
+    pub got: usize,
+    pub reinvocations: usize,
 }
 
 /// The compositor as load sees it
@@ -577,12 +602,83 @@ fn apply(host: &dyn Host, live: &Client, wanted: &Client) {
     }
 }
 
-fn place_live(host: &dyn Host, placer: &mut Placer, live: &[Client], report: &mut LoadReport) {
+/// Place every live window that claims a saved client; returns the windows claimed now
+fn place_live(host: &dyn Host, placer: &mut Placer, live: &[Client], report: &mut LoadReport) -> Vec<Address> {
+    let mut claimed = vec![];
     for window in live.iter().filter(|c| c.mapped) {
         if let Some(wanted) = placer.assign(window) {
             apply(host, window, &wanted);
             report.placed += 1;
+            claimed.push(window.address.clone());
         }
+    }
+    claimed
+}
+
+/// Wait for a launch group's window count to hold still (or reach `expected`),
+/// placing windows as they arrive; `claimed` counts the group's own new windows
+fn settle_group(
+    host: &dyn Host,
+    placer: &mut Placer,
+    before: &HashSet<Address>,
+    expected: usize,
+    claimed: &mut usize,
+    report: &mut LoadReport,
+) {
+    let mut stable = 0;
+    while *claimed < expected && stable < SETTLE_TICKS {
+        host.pause();
+        stable += 1;
+        let Ok(live) = host.clients() else { continue };
+        let new = place_live(host, placer, &live, report)
+            .into_iter()
+            .filter(|a| !before.contains(a))
+            .count();
+        if new > 0 {
+            *claimed += new;
+            stable = 0;
+        }
+    }
+}
+
+/// Make a launch group produce as many windows as it had saved. Once the group's windows
+/// have settled, a shortfall is met by re-invoking the group's command, at most once per
+/// missing window; the newcomers are placed through the Placer like any other window. A
+/// group that produced nothing is a failed launch and is only reported, never re-invoked.
+fn fulfil_group(
+    host: &dyn Host,
+    placer: &mut Placer,
+    entry: &ExecEntry,
+    group: &GroupInfo,
+    before: &HashSet<Address>,
+    mut claimed: usize,
+    report: &mut LoadReport,
+) {
+    let expected = group.saved.len();
+    settle_group(host, placer, before, expected, &mut claimed, report);
+    let mut reinvocations = 0;
+    if claimed > 0 {
+        let bound = expected.saturating_sub(claimed);
+        while reinvocations < bound && claimed < expected {
+            reinvocations += 1;
+            println!("'{}': {claimed} of {expected} windows; launching it again", group.label);
+            if host.send(&Op::Exec(entry.command.clone())).is_err() {
+                break;
+            }
+            settle_group(host, placer, before, expected, &mut claimed, report);
+        }
+    }
+    if claimed < expected {
+        println!(
+            "Warning: '{}' produced {claimed} of {expected} saved windows after {reinvocations} extra launches",
+            group.label
+        );
+        report.shortfalls.push(GroupShortfall {
+            label: group.label.clone(),
+            expected,
+            got: claimed,
+            reinvocations,
+        });
     }
 }
 
@@ -601,11 +697,15 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
             println!("Warning: failed to launch '{}': {e}", entry.command);
             continue;
         }
+        let mut claimed = 0;
         for _ in 0..LAUNCH_WAIT_TICKS {
             host.pause();
             let Ok(live) = host.clients() else { continue };
             if plan.place_by_class {
-                place_live(host, &mut placer, &live, &mut report);
+                claimed += place_live(host, &mut placer, &live, &mut report)
+                    .into_iter()
+                    .filter(|a| !before.contains(a))
+                    .count();
             }
             let new_window = live.iter().find(|c| c.mapped && !before.contains(&c.address));
             if let Some(window) = new_window {
@@ -615,6 +715,9 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
                 }
                 break;
             }
+        }
+        if let (true, Some(group)) = (plan.place_by_class, entry.group.as_ref()) {
+            fulfil_group(host, &mut placer, entry, group, &before, claimed, &mut report);
         }
     }
 
@@ -1063,6 +1166,111 @@ mod tests {
         let report = run_load(&host, &plan);
         assert!(report.unmatched.is_empty());
         assert!(host.pauses.get() < 10, "waited {} ticks", host.pauses.get());
+    }
+
+    fn group_entry(label: &str, saved: Vec<usize>) -> ExecEntry {
+        ExecEntry {
+            rules: ExecRules::default(),
+            command: label.to_string(),
+            group: Some(GroupInfo { label: label.to_string(), saved }),
+        }
+    }
+
+    fn brave_saved(n: i16) -> Vec<Client> {
+        (0..n).map(|i| client("brave", &format!("w{i}"), 1 + i as i32, false, (i, 0), (1, 1))).collect()
+    }
+
+    fn live_brave(i: i16) -> Client {
+        client("brave", &format!("live{i}"), 9, false, (50 + i, 0), (1, 1))
+    }
+
+    fn group_plan(entries: Vec<ExecEntry>, saved: Vec<Client>) -> LoadPlan {
+        LoadPlan { entries, saved, place_by_class: true, tail_ticks: 0, scope: None, restore_workspace: None }
+    }
+
+    #[test]
+    fn test_group_with_a_missing_window_is_launched_again_and_both_are_placed() {
+        // Two same-profile windows saved; the first launch brings up one, the second one more
+        let host = FakeHost::new(vec![], vec![vec![(1, live_brave(0))], vec![(1, live_brave(1))]]);
+        let plan = group_plan(vec![group_entry("brave --profile x", vec![0, 1])], brave_saved(2));
+        let report = run_load(&host, &plan);
+        assert_eq!(execs(&host), vec!["brave --profile x", "brave --profile x"]);
+        assert_eq!(report.placed, 2);
+        assert!(report.shortfalls.is_empty() && report.unmatched.is_empty());
+        // Each newcomer was moved to its saved workspace
+        let sent = host.sent.borrow();
+        for ws in [1, 2] {
+            assert!(sent.iter().any(|o| matches!(o, Op::MoveToWorkspace {
+                workspace: crate::dispatch::WorkspaceTarget::Id(id), ..
+            } if *id == ws)));
+        }
+    }
+
+    #[test]
+    fn test_refused_mint_is_reported_and_the_load_completes() {
+        let host = FakeHost::new(vec![], vec![vec![(1, live_brave(0))], vec![]]);
+        let plan = group_plan(vec![group_entry("brave", vec![0, 1])], brave_saved(2));
+        let report = run_load(&host, &plan);
+        assert_eq!(report.shortfalls, vec![GroupShortfall {
+            label: "brave".to_string(), expected: 2, got: 1, reinvocations: 1,
+        }]);
+        assert_eq!(execs(&host).len(), 2);
+    }
+
+    #[test]
+    fn test_reinvocations_are_bounded_by_the_shortfall() {
+        // Three saved, one produced: at most two more launches, even if nothing else appears
+        let host = FakeHost::new(vec![], vec![vec![(1, live_brave(0))]]);
+        let plan = group_plan(vec![group_entry("brave", vec![0, 1, 2])], brave_saved(3));
+        let report = run_load(&host, &plan);
+        assert_eq!(execs(&host).len(), 3);
+        assert_eq!(report.shortfalls[0].reinvocations, 2);
+    }
+
+    #[test]
+    fn test_complete_group_is_not_launched_again_and_does_not_wait() {
+        let host = FakeHost::new(vec![], vec![vec![(1, live_brave(0)), (1, live_brave(1))]]);
+        let plan = group_plan(vec![group_entry("brave", vec![0, 1])], brave_saved(2));
+        let report = run_load(&host, &plan);
+        assert_eq!(execs(&host).len(), 1);
+        assert!(report.shortfalls.is_empty());
+        assert!(host.pauses.get() < SETTLE_TICKS, "waited {} ticks", host.pauses.get());
+    }
+
+    #[test]
+    fn test_group_that_produced_nothing_is_reported_not_relaunched() {
+        let host = FakeHost::new(vec![], vec![vec![]]);
+        let plan = group_plan(vec![group_entry("ghost", vec![0, 1])], brave_saved(2));
+        let report = run_load(&host, &plan);
+        assert_eq!(execs(&host).len(), 1);
+        assert_eq!(report.shortfalls[0].got, 0);
+        assert_eq!(report.shortfalls[0].reinvocations, 0);
+    }
+
+    #[test]
+    fn test_legacy_entries_without_a_group_are_never_relaunched() {
+        let host = FakeHost::new(vec![], vec![vec![(1, live_brave(0))]]);
+        let plan = group_plan(vec![entry("[workspace 1 silent] brave")], brave_saved(2));
+        let report = run_load(&host, &plan);
+        assert_eq!(execs(&host).len(), 1);
+        assert!(report.shortfalls.is_empty());
+    }
+
+    #[test]
+    fn test_launch_groups_carry_their_saved_windows() {
+        let entries = launch_entries_from_saved_no_xdg(&[
+            saved_pid("brave", &["brave --profile-directory=Default"], 55, (0, 0)),
+            saved_pid("kitty", &["kitty"], 60, (5, 0)),
+            saved_pid("brave", &["brave --profile-directory=Default"], 55, (30, 0)),
+        ]);
+        let groups: Vec<(&str, &[usize])> = entries
+            .iter()
+            .map(|e| { let g = e.group.as_ref().unwrap(); (g.label.as_str(), g.saved.as_slice()) })
+            .collect();
+        assert_eq!(groups, vec![
+            ("brave --profile-directory=Default", &[0usize, 2][..]),
+            ("kitty", &[1usize][..]),
+        ]);
     }
 
     #[test]

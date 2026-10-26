@@ -269,6 +269,14 @@ impl LocalSession {
 fn simulate_load(dispatcher: &Dispatcher, plan: &LoadPlan) {
     for entry in &plan.entries {
         let _ = dispatcher.send(&Op::Exec(entry.command.clone()));
+        if let Some(group) = entry.group.as_ref().filter(|g| g.saved.len() > 1) {
+            println!(
+                "Expecting {} windows from '{}' (would launch it again up to {} times if short)",
+                group.saved.len(),
+                group.label,
+                group.saved.len() - 1
+            );
+        }
     }
     if plan.place_by_class {
         println!("After placement, windows matched by no saved client will be listed (not touched)");
@@ -284,6 +292,23 @@ fn simulate_load(dispatcher: &Dispatcher, plan: &LoadPlan) {
                 println!("Would send once the window exists: dispatch {}", dispatcher.render(&op));
             }
         }
+    }
+}
+
+/// Report launch groups that stayed short of their saved window count, with the saves left unmatched
+fn print_shortfalls(shortfalls: &[crate::load::GroupShortfall], unmatched: &[Client]) {
+    if shortfalls.is_empty() {
+        return;
+    }
+    println!("Launch groups short of their saved window count: {}", shortfalls.len());
+    for short in shortfalls {
+        println!(
+            "  '{}': {} of {} windows after {} extra launches",
+            short.label, short.got, short.expected, short.reinvocations
+        );
+    }
+    for client in unmatched {
+        println!("  unmatched save: '{}' ({}) workspace={}", client.title, client.class, client.workspace.id);
     }
 }
 
@@ -371,6 +396,7 @@ impl Session for LocalSession {
             let host = RealHost { dispatcher };
             let report = run_load(&host, &plan);
             println!("Placed {} windows, {} saved windows not matched", report.placed, report.unmatched.len());
+            print_shortfalls(&report.shortfalls, &report.unmatched);
             print_surplus(&report.surplus);
         }
 
