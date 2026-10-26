@@ -344,6 +344,11 @@ impl Placer {
         self.targets.iter().all(|t| t.matched.is_some())
     }
 
+    /// Addresses of the live windows that have claimed a saved client
+    pub fn claimed_addresses(&self) -> HashSet<Address> {
+        self.targets.iter().filter_map(|t| t.matched.clone()).collect()
+    }
+
     pub fn unmatched(&self) -> Vec<&Client> {
         self.targets.iter().filter(|t| t.matched.is_none()).map(|t| &t.saved).collect()
     }
@@ -394,6 +399,8 @@ impl LoadPlan {
 pub struct LoadReport {
     pub placed: usize,
     pub unmatched: Vec<Client>,
+    /// Live windows no saved client claimed (reported, never touched)
+    pub surplus: Vec<Client>,
 }
 
 /// The compositor as load sees it
@@ -623,6 +630,13 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
         report.unmatched = placer.unmatched().into_iter().cloned().collect();
         for client in &report.unmatched {
             println!("Warning: no window appeared for saved client '{}' ({})", client.title, client.class);
+        }
+        if let Ok(live) = host.clients() {
+            let claimed = placer.claimed_addresses();
+            report.surplus = live
+                .into_iter()
+                .filter(|c| c.mapped && !claimed.contains(&c.address))
+                .collect();
         }
     }
 
@@ -1049,6 +1063,60 @@ mod tests {
         let report = run_load(&host, &plan);
         assert!(report.unmatched.is_empty());
         assert!(host.pauses.get() < 10, "waited {} ticks", host.pauses.get());
+    }
+
+    #[test]
+    fn test_surplus_windows_are_reported_and_left_alone() {
+        // Saved: one kitty. Live: that kitty, plus a window opened since the save
+        let kitty = client("kitty", "t", 5, false, (1, 0), (1, 1));
+        let mut stray = client("mpv", "opened later", 3, false, (9, 0), (1, 1));
+        stray.address = hyprland::shared::Address::new("0xabc");
+        let host = FakeHost::new(vec![kitty, stray.clone()], vec![]);
+        let plan = LoadPlan {
+            entries: vec![],
+            saved: vec![client("kitty", "t", 2, false, (0, 0), (1, 1))],
+            place_by_class: true,
+            tail_ticks: 5,
+            scope: None,
+            restore_workspace: None,
+        };
+        let report = run_load(&host, &plan);
+        assert_eq!(report.surplus.len(), 1);
+        assert_eq!(report.surplus[0].address, stray.address);
+        assert_eq!(report.surplus[0].class, "mpv");
+        // Report only: nothing was dispatched for the stray window
+        assert!(!host.sent.borrow().iter().any(|op| format!("{op:?}").contains("0xabc")));
+    }
+
+    #[test]
+    fn test_surplus_includes_same_class_windows_beyond_the_saved_count() {
+        let a = client("brave", "a", 1, false, (0, 0), (1, 1));
+        let mut b = client("brave", "b", 1, false, (5, 0), (1, 1));
+        b.address = hyprland::shared::Address::new("0xdef");
+        let host = FakeHost::new(vec![a, b], vec![]);
+        let plan = LoadPlan {
+            entries: vec![],
+            saved: vec![client("brave", "a", 1, false, (0, 0), (1, 1))],
+            place_by_class: true,
+            tail_ticks: 2,
+            scope: None,
+            restore_workspace: None,
+        };
+        assert_eq!(run_load(&host, &plan).surplus.len(), 1);
+    }
+
+    #[test]
+    fn test_legacy_plans_report_no_surplus() {
+        let host = FakeHost::new(vec![client("kitty", "t", 1, false, (0, 0), (1, 1))], vec![vec![]]);
+        let plan = LoadPlan {
+            entries: vec![entry("[workspace 1 silent] daemon")],
+            saved: vec![],
+            place_by_class: false,
+            tail_ticks: 0,
+            scope: None,
+            restore_workspace: None,
+        };
+        assert!(run_load(&host, &plan).surplus.is_empty());
     }
 
     #[test]

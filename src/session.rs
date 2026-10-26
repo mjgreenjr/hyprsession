@@ -271,6 +271,7 @@ fn simulate_load(dispatcher: &Dispatcher, plan: &LoadPlan) {
         let _ = dispatcher.send(&Op::Exec(entry.command.clone()));
     }
     if plan.place_by_class {
+        println!("After placement, windows matched by no saved client will be listed (not touched)");
         for wanted in &plan.saved {
             for op in plan_adjustment(&placeholder_client(), wanted) {
                 println!("Would send once the window exists: dispatch {}", dispatcher.render(&op));
@@ -283,6 +284,20 @@ fn simulate_load(dispatcher: &Dispatcher, plan: &LoadPlan) {
                 println!("Would send once the window exists: dispatch {}", dispatcher.render(&op));
             }
         }
+    }
+}
+
+/// List live windows no saved client claimed. They are not touched.
+fn print_surplus(surplus: &[Client]) {
+    if surplus.is_empty() {
+        return;
+    }
+    println!("Windows not matched to any saved client: {}", surplus.len());
+    for window in surplus {
+        println!(
+            "  surplus {} class='{}' title='{}' workspace={}",
+            window.address, window.class, window.title, window.workspace.id
+        );
     }
 }
 
@@ -356,6 +371,7 @@ impl Session for LocalSession {
             let host = RealHost { dispatcher };
             let report = run_load(&host, &plan);
             println!("Placed {} windows, {} saved windows not matched", report.placed, report.unmatched.len());
+            print_surplus(&report.surplus);
         }
 
         println!("Finished loading session");
