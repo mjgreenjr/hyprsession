@@ -44,7 +44,7 @@ Various options can be used to modify the behavior of Hyprsession.
 ### [mode]
 One of
 * default - Loads the session at startup the saves the current session at regular intervals.
-* load - Load the session given by name (clears current session first: windows are asked to close, then any left are sent SIGTERM after 15s, then SIGKILL; the load aborts if anything survives)
+* load - Load the session given by name (clears current session first, then launches each distinct command recorded in the snapshot (the saved argv; exec.conf for older snapshots): windows are asked to close, then any left are sent SIGTERM after 15s, then SIGKILL; the load aborts if anything survives)
 * save - Save the current session 
 * clear - Clear the current session (removes all windows)
 * list - List all available sessions

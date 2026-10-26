@@ -3,7 +3,7 @@ use hyprland::shared::{HyprData, HyprDataActive};
 use crate::command_detection::{fetch_command, read_argv, read_cwd};
 use serde::{Deserialize, Serialize};
 use crate::dispatch::{Dialect, Dispatcher, Op, WorkspaceTarget};
-use crate::load::{desired_from_rules, launch_order, placeholder_client, parse_exec_conf, run_load, clear_session, ClearConfig, LoadPlan, RealHost};
+use crate::load::{desired_from_rules, launch_entries_from_saved, launch_order, placeholder_client, parse_exec_conf, run_load, clear_session, ClearConfig, LoadPlan, RealHost};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -227,6 +227,13 @@ impl LocalSession {
         let new_format = saved.iter().any(|c| c.argv.is_some());
         let place_by_class = self.adjust_clients_only || new_format;
 
+        // New-format snapshots launch exactly what was recorded (argv); exec.conf has
+        // been validated above but its lines went through command heuristics and
+        // remain the launch source only for legacy snapshots
+        if new_format && !self.adjust_clients_only {
+            entries = launch_entries_from_saved(&saved);
+        }
+
         Ok(LoadPlan {
             entries: launch_order(entries),
             saved: if place_by_class { saved.into_iter().map(|c| c.client).collect() } else { vec![] },
@@ -418,6 +425,86 @@ mod tests {
         // Still readable as a plain client list by older consumers
         let plain: Vec<Client> = serde_json::from_str(&json).unwrap();
         assert_eq!(plain[0], saved.client);
+    }
+
+    fn sim_session(dir: &std::path::Path) -> LocalSession {
+        LocalSession {
+            base_path: dir.to_str().unwrap().to_string(),
+            simulate: true,
+            load_time: 1,
+            adjust_clients_only: false,
+            save_duplicate_pids: false,
+            dialect: Dialect::Lua,
+        }
+    }
+
+    fn write_clients(dir: &std::path::Path, clients: &[SavedClient]) {
+        std::fs::write(dir.join(CLIENTS_PATH_NAME), serde_json::to_vec(clients).unwrap()).unwrap();
+    }
+
+    fn with_argv(class: &str, argv: &[&str], ws: i32, at: (i16, i16)) -> SavedClient {
+        SavedClient {
+            client: client(class, "t", ws, false, at, (10, 10)),
+            argv: Some(argv.iter().map(|s| s.to_string()).collect()),
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn test_new_format_launches_every_distinct_argv_despite_stale_exec_conf() {
+        let dir = tempfile::tempdir().unwrap();
+        // exec.conf is stale and degraded: one bare 'brave', nothing else
+        std::fs::write(dir.path().join(EXEC_NAME), "[workspace 1 silent] brave\n").unwrap();
+        write_clients(dir.path(), &[
+            with_argv("brave", &["/opt/brave/brave", "--app=https://example.test"], 5, (0, 0)),
+            with_argv("brave", &["/opt/brave/brave", "--user-data-dir=/home/x/profile two"], 1, (0, 0)),
+            with_argv("brave", &["/opt/brave/brave", "--user-data-dir=/home/x/profile two"], 1, (50, 0)),
+            with_argv("kitty", &["kitty"], 2, (0, 0)),
+        ]);
+        let plan = sim_session(dir.path()).prepare_load(dir.path()).unwrap();
+        assert!(plan.place_by_class);
+        let commands: Vec<&str> = plan.entries.iter().map(|e| e.command.as_str()).collect();
+        // Launch order: workspace ascending
+        assert_eq!(commands, vec![
+            "/opt/brave/brave '--user-data-dir=/home/x/profile two'",
+            "kitty",
+            "/opt/brave/brave --app=https://example.test",
+        ]);
+        assert!(!commands.contains(&"brave"));
+    }
+
+    #[test]
+    fn test_new_format_still_requires_a_valid_exec_conf() {
+        let dir = tempfile::tempdir().unwrap();
+        write_clients(dir.path(), &[with_argv("kitty", &["kitty"], 1, (0, 0))]);
+        // Missing
+        assert!(sim_session(dir.path()).prepare_load(dir.path()).is_err());
+        // Unparseable
+        std::fs::write(dir.path().join(EXEC_NAME), "[move a b] x\n").unwrap();
+        assert!(sim_session(dir.path()).prepare_load(dir.path()).is_err());
+        // Empty
+        std::fs::write(dir.path().join(EXEC_NAME), "\n").unwrap();
+        assert!(sim_session(dir.path()).prepare_load(dir.path()).is_err());
+        // Valid
+        std::fs::write(dir.path().join(EXEC_NAME), "[workspace 1 silent] kitty\n").unwrap();
+        assert!(sim_session(dir.path()).prepare_load(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn test_legacy_snapshot_follows_the_exec_conf_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let exec = "[workspace 2 silent;float;move 5 6;size 7 8] kitty --title 'a b'\n[workspace 1 silent;move 0 0] brave\n";
+        std::fs::write(dir.path().join(EXEC_NAME), exec).unwrap();
+        // Old-format clients.json: windows but no argv anywhere
+        write_clients(dir.path(), &[
+            SavedClient { client: client("kitty", "t", 2, true, (5, 6), (7, 8)), argv: None, cwd: None },
+        ]);
+        let plan = sim_session(dir.path()).prepare_load(dir.path()).unwrap();
+        assert!(!plan.place_by_class);
+        assert!(plan.saved.is_empty());
+        assert_eq!(plan.entries, launch_order(parse_exec_conf(exec).unwrap()));
+        let commands: Vec<&str> = plan.entries.iter().map(|e| e.command.as_str()).collect();
+        assert_eq!(commands, vec!["brave", "kitty --title 'a b'"]);
     }
 
     #[test]

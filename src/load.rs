@@ -5,7 +5,8 @@
 //! tested against a fake one.
 
 use crate::dispatch::{Dispatcher, Op};
-use crate::session::plan_adjustment;
+use crate::command_detection::shell_join;
+use crate::session::{plan_adjustment, SavedClient};
 use hyprland::data::{Client, Clients, FullscreenMode, Workspace};
 use hyprland::shared::{Address, HyprData, HyprDataActive};
 use std::collections::HashSet;
@@ -122,6 +123,45 @@ pub fn parse_exec_conf(text: &str) -> Result<Vec<ExecEntry>, String> {
         .filter(|(_, l)| !l.trim().is_empty())
         .map(|(n, l)| parse_exec_line(l).map_err(|e| format!("exec.conf line {}: {e}", n + 1)))
         .collect()
+}
+
+/// Placement rules equivalent to a saved window's state
+fn rules_from_client(client: &Client) -> ExecRules {
+    let workspace = match client.workspace.name.strip_prefix("special:") {
+        Some(name) => RuleWorkspace::Special(Some(name.to_string())),
+        None if client.workspace.id == -99 => RuleWorkspace::Special(None),
+        None => RuleWorkspace::Id(client.workspace.id),
+    };
+    ExecRules {
+        monitor: client.monitor,
+        workspace: Some(workspace),
+        float: client.floating,
+        at: Some(client.at),
+        size: Some(client.size),
+        pin: client.pinned,
+        fullscreen: match client.fullscreen {
+            FullscreenMode::None => None,
+            mode => Some(mode as i32),
+        },
+        unknown: vec![],
+    }
+}
+
+/// Launch entries for a new-format snapshot, built from the recorded argv: the argv
+/// shell-joined, one entry per distinct command string, with rules taken from the
+/// first saved window that carries that command. Windows without argv cannot be
+/// launched and are skipped (they are still placed if their app brings them up).
+pub fn launch_entries_from_saved(saved: &[SavedClient]) -> Vec<ExecEntry> {
+    let mut entries: Vec<ExecEntry> = vec![];
+    for window in saved {
+        let Some(argv) = window.argv.as_ref().filter(|a| !a.is_empty()) else { continue };
+        let command = shell_join(argv);
+        if entries.iter().any(|e| e.command == command) {
+            continue;
+        }
+        entries.push(ExecEntry { rules: rules_from_client(&window.client), command });
+    }
+    entries
 }
 
 /// Order launches so a tiling layout regrows as it was: workspace ascending, then
@@ -554,6 +594,36 @@ mod tests {
         assert!(parse_exec_line("[move 1] x").is_err());
         let err = parse_exec_conf("[workspace 1 silent] ok\n\n[move a b] bad\n").unwrap_err();
         assert!(err.contains("line 3"), "{err}");
+    }
+
+    fn saved(class: &str, argv: Option<&[&str]>, ws: i32, floating: bool, at: (i16, i16)) -> SavedClient {
+        SavedClient {
+            client: client(class, "t", ws, floating, at, (100, 50)),
+            argv: argv.map(|a| a.iter().map(|s| s.to_string()).collect()),
+            cwd: Some("/home/synthetic".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_launch_entries_from_saved_argv() {
+        let entries = launch_entries_from_saved(&[
+            saved("brave", Some(&["/opt/brave/brave", "--app=https://example.test/a b"]), 5, false, (0, 0)),
+            // Another window of the same process: same command, not launched again
+            saved("brave", Some(&["/opt/brave/brave", "--app=https://example.test/a b"]), 6, true, (9, 9)),
+            // A second instance with its own profile is a distinct launch
+            saved("brave", Some(&["/opt/brave/brave", "--user-data-dir=/home/x/p"]), 1, false, (3, 4)),
+            // No argv: cannot be launched
+            saved("ghost", None, 2, false, (0, 0)),
+        ]);
+        let commands: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
+        assert_eq!(commands, vec![
+            "/opt/brave/brave '--app=https://example.test/a b'",
+            "/opt/brave/brave --user-data-dir=/home/x/p",
+        ]);
+        // Rules come from the first window carrying each command
+        assert_eq!(entries[0].rules.workspace, Some(RuleWorkspace::Id(5)));
+        assert!(!entries[0].rules.float);
+        assert_eq!(entries[1].rules.at, Some((3, 4)));
     }
 
     #[test]
