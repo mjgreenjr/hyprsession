@@ -6,6 +6,7 @@
 
 use crate::dispatch::{Dispatcher, Op};
 use crate::command_detection::{resolve_desktop_command, shell_join, shell_quote};
+use crate::resume::{program_identity, terminal_style, wrap_terminal_command, Relaunch, ResumeConfig};
 use crate::session::{plan_adjustment, SavedClient};
 use hyprland::data::{Client, Clients, FullscreenMode, Workspace};
 use hyprland::shared::{Address, HyprData, HyprDataActive};
@@ -190,7 +191,7 @@ fn is_sandbox_internal(argv: &[String]) -> bool {
 /// cannot be launched and are skipped (they are still placed if their app brings them
 /// up).
 pub fn launch_entries_from_saved(saved: &[SavedClient], xdg_map: &HashMap<String, String>) -> Vec<ExecEntry> {
-    launch_entries_with(saved, xdg_map, &|dir| dir.is_dir())
+    launch_entries_with(saved, xdg_map, &|dir| dir.is_dir(), &ResumeConfig::default())
 }
 
 /// Prefix a launch with `cd <cwd> &&` so it runs from its recorded directory. A
@@ -208,11 +209,55 @@ pub fn wrap_cwd(command: String, cwd: Option<&str>, window: &Client, dir_exists:
     }
 }
 
+/// A terminal with a recorded foreground program is launched running it (resume command,
+/// or its argv replayed), in the program's own directory, and falls through to a shell
+/// when it exits. When the program owns its own window, has no way to be run, or the policy
+/// says so, the terminal comes back at a plain prompt.
+fn terminal_launch(
+    command: String,
+    window: &SavedClient,
+    resume: &ResumeConfig,
+    dir_exists: &dyn Fn(&Path) -> bool,
+) -> String {
+    let Some(foreground) = window.foreground.as_ref() else { return command };
+    let title = &window.client.title;
+    let (kind, program) = match resume.decide(foreground) {
+        Relaunch::Linked => {
+            println!("Terminal '{title}': its foreground program owns its own window; restoring at a clean prompt");
+            return command;
+        }
+        Relaunch::CleanPrompt(reason) => {
+            println!("Terminal '{title}': restoring at a clean prompt ({reason})");
+            return command;
+        }
+        Relaunch::Table(program) => ("resume command", program),
+        Relaunch::Replay(program) => ("recorded command", program),
+    };
+    let terminal = window.argv.as_deref().and_then(program_identity).unwrap_or_default();
+    let Some(style) = terminal_style(&terminal) else {
+        println!(
+            "Warning: no verified way to run a command in '{terminal}'; terminal '{title}' restores at a clean prompt"
+        );
+        return command;
+    };
+    let cwd = match foreground.cwd.as_deref() {
+        Some(dir) if dir_exists(Path::new(dir)) => dir.to_string(),
+        Some(dir) => {
+            println!("Warning: working directory '{dir}' of '{program}' in terminal '{title}' no longer exists");
+            ".".to_string()
+        }
+        None => ".".to_string(),
+    };
+    println!("Terminal '{title}': running {kind} '{program}' in {cwd}");
+    wrap_terminal_command(&command, style, &cwd, &program)
+}
+
 /// `launch_entries_from_saved` with the directory check injected
 pub fn launch_entries_with(
     saved: &[SavedClient],
     xdg_map: &HashMap<String, String>,
     dir_exists: &dyn Fn(&Path) -> bool,
+    resume: &ResumeConfig,
 ) -> Vec<ExecEntry> {
     let mut entries: Vec<ExecEntry> = vec![];
     let mut group_rules: HashMap<String, ExecRules> = HashMap::new();
@@ -243,6 +288,7 @@ pub fn launch_entries_with(
             None => {
                 launched.insert((command.clone(), window.client.pid), entries.len());
                 let label = command.clone();
+                let command = terminal_launch(command, window, resume, dir_exists);
                 // A sandbox's cwd is a path inside the sandbox: not wrapped, not warned about
                 let launch = if sandboxed {
                     command
@@ -1014,6 +1060,7 @@ mod tests {
             ],
             &HashMap::new(),
             &exists,
+            &ResumeConfig::default(),
         );
         let commands: Vec<&str> = entries.iter().map(|e| e.command.as_str()).collect();
         assert_eq!(commands, vec![
@@ -1026,7 +1073,7 @@ mod tests {
     #[test]
     fn test_missing_cwd_launches_unwrapped() {
         let gone = |_: &Path| false;
-        let entries = launch_entries_with(&[saved_cwd(&["./playcall-gui"], 1, Some("/gone"))], &HashMap::new(), &gone);
+        let entries = launch_entries_with(&[saved_cwd(&["./playcall-gui"], 1, Some("/gone"))], &HashMap::new(), &gone, &ResumeConfig::default());
         assert_eq!(entries[0].command, "./playcall-gui");
     }
 
@@ -1040,7 +1087,7 @@ mod tests {
         let mut vesktop = saved_cwd(&["/app/bin/vesktop"], 5, Some("/app/some/sandbox/dir"));
         vesktop.client.initial_class = "dev.vencord.Vesktop".to_string();
         let exists = |_: &Path| true;
-        let entries = launch_entries_with(&[vesktop], &xdg, &exists);
+        let entries = launch_entries_with(&[vesktop], &xdg, &exists, &ResumeConfig::default());
         assert_eq!(entries[0].command, "/usr/bin/flatpak run dev.vencord.Vesktop");
     }
 
@@ -1057,6 +1104,7 @@ mod tests {
             &[saved_cwd(&["./playcall-gui"], 1, Some(project.path().to_str().unwrap()))],
             &HashMap::new(),
             &exists,
+            &ResumeConfig::default(),
         );
         let status = std::process::Command::new("sh")
             .arg("-c").arg(&entries[0].command).current_dir(elsewhere.path()).status().unwrap();

@@ -108,7 +108,69 @@ hyprsession command firefox "flatpak run org.mozilla.firefox"
 ```
 creates a script in the `~/.local/bin` directory that runs the correct command.
 
+## Working directories
+Each window is launched from the working directory it had when it was saved (`cd <dir> && <command>`), so programs
+started with relative paths (`./my-app`) come back. If the directory no longer exists the program is launched from
+the loader's directory and a warning names the window and the missing directory. Windows of sandboxed (Flatpak)
+applications are launched through their desktop entry and are not wrapped.
+
+## Programs running inside terminals
+When a saved window is a terminal (currently `foot`, `kitty` and `alacritty`), hyprsession looks in `/proc` for the
+program holding the terminal's foreground and records its command line and directory in `clients.json`
+(the optional `foreground` field). On load the terminal is relaunched running that program, in its recorded
+directory; when the program exits the terminal falls through to a shell prompt instead of closing. The terminal's own
+recorded directory is that of its shell.
+
+Which command is run is decided by program name:
+* a program in the resume table is started with its resume command (below);
+* any other program is replayed with its recorded command line (set `unlisted = "prompt"` to restore the terminal
+  at a clean prompt instead);
+* a program that owns its own window (for instance a GUI app started from the terminal, matched by process id)
+  is not relaunched in the terminal: the terminal returns at a prompt and the program returns through its own window.
+
+The built-in resume table (replacement command lines; any other flags that were recorded are dropped):
+
+| Program | Resume command |
+|---|---|
+| claude | `claude --continue` |
+| muse | `muse resume --last` |
+| codex | `codex resume --last` |
+| gemini | `gemini --resume` |
+| aider | `aider --restore-chat-history` |
+| opencode | `opencode --continue` |
+| copilot | `copilot --continue` |
+| goose | `goose session --resume` |
+| qwen | `qwen --continue` |
+
+`~/.config/hyprsession/resume.toml` (or `$XDG_CONFIG_HOME/hyprsession/resume.toml`) extends and overrides it:
+```toml
+[settings]
+unlisted = "replay"      # or "prompt"
+
+[resume]
+claude = "claude --continue --model sonnet"
+mytool = "mytool --last"
+aider  = ""              # resume nothing: restore the terminal at a prompt
+```
+A resume file that cannot be parsed stops a load before anything is closed (the error names the file and line),
+including under `--simulate`.
+
+Note that the command lines of foreground programs are written to `clients.json`: do not keep secrets in
+command-line arguments if snapshots are shared.
+
+## Window counts and reports
+Programs that own several saved windows are launched once. If fewer windows than were saved appear, the launch is
+repeated (at most once per missing window); a shortfall that remains is reported with the saved windows left
+unmatched, and the load still completes. After placement, live windows that no saved window claimed are listed
+(address, class, title, workspace); they are never touched.
+
 ## Change log
+### Unreleased
+* Launch windows from their saved working directory
+* Restore the program running in the foreground of a terminal (resume table, `resume.toml`)
+* Launch again when a program produced fewer windows than were saved
+* `--workspace` to load a single workspace
+* Report live windows that match no saved window
 ### 0.1.1
 * Changed --session-path option to point at base directory of session file
 ### 0.1.2

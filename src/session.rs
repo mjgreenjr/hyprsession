@@ -1,10 +1,12 @@
 use hyprland::data::{Client, Clients, FullscreenMode, Workspace};
 use hyprland::shared::{HyprData, HyprDataActive};
-use crate::command_detection::{fetch_command, read_argv, read_cwd};
+use crate::command_detection::fetch_command;
+use crate::procfs::{capture_terminal, ProcFs, ProcTable, RealProc};
+use crate::resume::{default_resume_path, program_identity, strip_wrapper, terminal_style, Relaunch, ResumeConfig};
 use serde::{Deserialize, Serialize};
 use crate::dispatch::{Dialect, Dispatcher, Op, WorkspaceTarget};
-use crate::load::{clear_windows, RuleWorkspace, Scope, desired_from_rules, launch_entries_from_saved, launch_order, placeholder_client, parse_exec_conf, run_load, ClearConfig, LoadPlan, RealHost};
-use std::collections::HashMap;
+use crate::load::{clear_windows, RuleWorkspace, Scope, desired_from_rules, launch_entries_with, launch_order, placeholder_client, parse_exec_conf, run_load, ClearConfig, LoadPlan, RealHost};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 const EXEC_NAME: &str = "exec.conf";
@@ -100,13 +102,65 @@ impl TryFrom<serde_json::Value> for SavedClient {
 }
 
 impl SavedClient {
-    pub fn capture(client: &Client) -> Self {
-        SavedClient {
-            client: client.clone(),
-            argv: read_argv(client.pid),
-            cwd: read_cwd(client.pid),
-            foreground: None,
+    /// Record every window of a snapshot. Terminal windows also get the program in the
+    /// foreground of their tty, linked when that program owns another saved window.
+    pub fn capture_all(clients: &[Client], proc: &dyn ProcFs, resume: &ResumeConfig) -> Vec<SavedClient> {
+        let mut table: Option<ProcTable> = None;
+        let mut captured: Vec<(SavedClient, Vec<i32>)> = vec![];
+        for client in clients {
+            let mut argv = proc.argv(client.pid);
+            let mut cwd = proc.cwd(client.pid);
+            let mut foreground = None;
+            let mut related_pids = vec![];
+            let name = argv
+                .as_deref()
+                .and_then(program_identity)
+                .filter(|n| resume.is_terminal(n))
+                .or_else(|| proc.exe_name(client.pid).map(|n| n.to_lowercase()).filter(|n| resume.is_terminal(n)));
+            if let Some(name) = name {
+                if clients.iter().filter(|c| c.pid == client.pid).count() > 1 {
+                    println!(
+                        "Warning: terminal '{}' shares its process with other windows; its foreground program is not recorded",
+                        client.title
+                    );
+                } else {
+                    let table = table.get_or_insert_with(|| ProcTable::read(proc));
+                    let found = capture_terminal(proc, table, client.pid);
+                    if found.ambiguous {
+                        println!(
+                            "Warning: terminal '{}' runs several shells in one process; its foreground program is not recorded",
+                            client.title
+                        );
+                    }
+                    // The shell may have cd'd since the terminal was launched
+                    if found.shell_cwd.is_some() {
+                        cwd = found.shell_cwd;
+                    }
+                    if let Some(fg) = found.foreground {
+                        related_pids = fg.group_pids.iter().chain(&fg.descendant_pids).copied().collect();
+                        foreground = Some(Foreground { pid: fg.pid, argv: fg.argv, cwd: fg.cwd, linked: false });
+                    }
+                }
+                // A terminal relaunched by hyprsession carries its wrapper: record the terminal itself
+                if let Some(argv) = argv.as_mut() {
+                    *argv = strip_wrapper(argv, terminal_style(&name));
+                }
+            }
+            captured.push((SavedClient { client: client.clone(), argv, cwd, foreground }, related_pids));
         }
+
+        // A foreground program that is (or whose process group or descendants include) another
+        // saved window's process owns that window: it returns through its own entry
+        let pids: HashSet<i32> = clients.iter().map(|c| c.pid).collect();
+        captured
+            .into_iter()
+            .map(|(mut saved, related)| {
+                if let Some(fg) = saved.foreground.as_mut() {
+                    fg.linked = related.iter().any(|pid| *pid != saved.client.pid && pids.contains(pid));
+                }
+                saved
+            })
+            .collect()
     }
 }
 
@@ -114,13 +168,28 @@ impl SavedClient {
 /// entry per window of (class, workspace, floating, position, size, argv). Addresses,
 /// pids and ordering are deliberately left out.
 pub fn fingerprint(clients: &[SavedClient]) -> Vec<String> {
+    fingerprint_with(clients, &ResumeConfig::default())
+}
+
+/// `fingerprint` for a given resume configuration. A terminal's foreground program counts
+/// as what load would run for it (not its raw argv, which a resume command rewrites), and
+/// its directory.
+pub fn fingerprint_with(clients: &[SavedClient], resume: &ResumeConfig) -> Vec<String> {
     let mut entries: Vec<String> = clients
         .iter()
         .map(|c| {
             let k = &c.client;
+            let foreground = match &c.foreground {
+                None => "-".to_string(),
+                Some(fg) => match resume.decide(fg) {
+                    Relaunch::Linked => "linked".to_string(),
+                    Relaunch::Table(cmd) | Relaunch::Replay(cmd) => format!("{cmd} @ {:?}", fg.cwd),
+                    Relaunch::CleanPrompt(_) => "prompt".to_string(),
+                },
+            };
             format!(
-                "{}|{}|{}|{:?}|{:?}|{:?}",
-                k.class, k.workspace.id, k.floating, k.at, k.size, c.argv
+                "{}|{}|{}|{:?}|{:?}|{:?}|{}",
+                k.class, k.workspace.id, k.floating, k.at, k.size, c.argv, foreground
             )
         })
         .collect();
@@ -237,6 +306,13 @@ impl LocalSession {
 
     /// Read and validate a snapshot, returning what load will do
     fn prepare_load(&self, base_dir: &std::path::Path) -> hyprland::Result<LoadPlan> {
+        // A bad resume file fails here, before anything is touched (and under --simulate)
+        let resume = ResumeConfig::load(default_resume_path().as_deref())
+            .map_err(hyprland::error::HyprError::Other)?;
+        self.prepare_load_with(base_dir, &resume)
+    }
+
+    fn prepare_load_with(&self, base_dir: &std::path::Path, resume: &ResumeConfig) -> hyprland::Result<LoadPlan> {
         let fail = |msg: String| hyprland::error::HyprError::Other(msg);
 
         let saved: Vec<SavedClient> = match std::fs::read_to_string(base_dir.join(CLIENTS_PATH_NAME)) {
@@ -282,7 +358,7 @@ impl LocalSession {
         // been validated above but its lines went through command heuristics and
         // remain the launch source only for legacy snapshots
         if new_format && !self.adjust_clients_only {
-            entries = launch_entries_from_saved(&saved, &crate::command_faker::build_xdg_command_map());
+            entries = launch_entries_with(&saved, &crate::command_faker::build_xdg_command_map(), &|dir| dir.is_dir(), resume);
         } else if let Some(workspace) = self.workspace {
             // Legacy launch lines carry their workspace in their rules
             entries.retain(|e| e.rules.workspace == Some(RuleWorkspace::Id(workspace)));
@@ -396,9 +472,16 @@ impl Session for LocalSession {
         let mut exec_lines: Vec<String> = vec![];
         let xdg_map: HashMap<String, String> = crate::command_faker::build_xdg_command_map();
 
-        for info in client_info.iter().rev() {
+        let resume = ResumeConfig::load(default_resume_path().as_deref()).unwrap_or_else(|e| {
+            println!("Warning: {e}; using the built-in resume table");
+            ResumeConfig::default()
+        });
+        let ordered: Vec<Client> = client_info.iter().rev().cloned().collect();
+        let captured = SavedClient::capture_all(&ordered, &RealProc, &resume);
+
+        for (info, saved) in ordered.iter().zip(captured) {
             // Every window is recorded in clients.json, whatever happens to its command
-            saved_clients.push(SavedClient::capture(info));
+            saved_clients.push(saved);
             // exec.conf holds one launch line per distinct process
             if !self.save_duplicate_pids && pids.contains(&info.pid) {
                 continue;
@@ -767,5 +850,266 @@ mod tests {
         std::fs::write(dir.path().join(EXEC_NAME), "[workspace 1 silent] kitty\n").unwrap();
         write_clients(dir.path(), &[with_argv("kitty", &["kitty"], 1, (0, 0))]);
         assert!(scoped_session(dir.path(), 1).load("").is_ok());
+    }
+
+    // ---- V2: inside-terminal capture, planning, fixed point ----
+
+    use crate::procfs::fake::{run_in_foreground, terminal_with_shell, FakeProc};
+
+    fn terminal_window(pid: i32, workspace: i32) -> Client {
+        let mut c = client("foot", "term", workspace, false, (workspace as i16, 0), (10, 10));
+        c.pid = pid;
+        c
+    }
+
+    fn gui_window(class: &str, pid: i32) -> Client {
+        let mut c = client(class, class, 1, false, (7, 7), (10, 10));
+        c.pid = pid;
+        c
+    }
+
+    fn capture(p: &FakeProc, clients: &[Client]) -> Vec<SavedClient> {
+        SavedClient::capture_all(clients, p, &ResumeConfig::default())
+    }
+
+    #[test]
+    fn test_terminal_running_claude_records_the_foreground_program() {
+        let mut p = terminal_with_shell();
+        run_in_foreground(&mut p, 200, &["claude"], "/home/synthetic/proj");
+        let saved = capture(&p, &[terminal_window(100, 1)]);
+        let fg = saved[0].foreground.as_ref().unwrap();
+        assert_eq!((fg.pid, fg.argv.clone(), fg.cwd.as_deref(), fg.linked),
+                   (200, vec!["claude".to_string()], Some("/home/synthetic/proj"), false));
+    }
+
+    #[test]
+    fn test_terminal_client_cwd_is_the_shells_cwd_not_the_terminal_process_cwd() {
+        let p = terminal_with_shell();
+        let saved = capture(&p, &[terminal_window(100, 1)]);
+        assert_eq!(saved[0].cwd.as_deref(), Some("/home/synthetic/shell-dir"));
+        // Nothing but the shell running: no foreground record
+        assert!(saved[0].foreground.is_none());
+    }
+
+    #[test]
+    fn test_non_terminal_windows_get_no_foreground_and_keep_their_cwd() {
+        let mut p = terminal_with_shell();
+        p.add(900, 1, 900, 900, 0, -1, &["/usr/bin/mpv"], "/home/synthetic/videos");
+        let saved = capture(&p, &[gui_window("mpv", 900)]);
+        assert!(saved[0].foreground.is_none());
+        assert_eq!(saved[0].cwd.as_deref(), Some("/home/synthetic/videos"));
+    }
+
+    #[test]
+    fn test_gui_app_started_from_a_terminal_is_linked() {
+        // The playcall pattern: the terminal's foreground program IS the GUI window's process
+        let mut p = terminal_with_shell();
+        run_in_foreground(&mut p, 200, &["./playcall-gui"], "/home/synthetic/Work/playcall-gui");
+        let saved = capture(&p, &[terminal_window(100, 1), gui_window("playcall-gui", 200)]);
+        assert!(saved[0].foreground.as_ref().unwrap().linked);
+        // And the GUI window carries no foreground of its own
+        assert!(saved[1].foreground.is_none());
+    }
+
+    #[test]
+    fn test_wrapper_script_launching_the_gui_is_linked_through_its_descendant() {
+        // The foreground leader is a shell script (pid 200); the GUI window's process (pid 201) is its child
+        let mut p = terminal_with_shell();
+        run_in_foreground(&mut p, 200, &["sh", "./run.sh"], "/home/synthetic/proj");
+        p.add(201, 200, 200, 101, 5, 200, &["./playcall-gui"], "/home/synthetic/proj");
+        let saved = capture(&p, &[terminal_window(100, 1), gui_window("playcall-gui", 201)]);
+        assert!(saved[0].foreground.as_ref().unwrap().linked);
+    }
+
+    #[test]
+    fn test_a_group_member_that_is_a_saved_window_links() {
+        let mut p = terminal_with_shell();
+        run_in_foreground(&mut p, 200, &["sh", "-c", "a | b"], "/tmp");
+        p.add(202, 101, 200, 101, 5, 200, &["b"], "/tmp");
+        let saved = capture(&p, &[terminal_window(100, 1), gui_window("b", 202)]);
+        assert!(saved[0].foreground.as_ref().unwrap().linked);
+    }
+
+    #[test]
+    fn test_linkage_is_pid_identity_not_command_matching() {
+        // A saved GUI window runs the same command as the terminal's foreground program, but is another process
+        let mut p = terminal_with_shell();
+        run_in_foreground(&mut p, 200, &["playcall-gui"], "/tmp");
+        p.add(300, 1, 300, 300, 0, -1, &["playcall-gui"], "/tmp");
+        let saved = capture(&p, &[terminal_window(100, 1), gui_window("playcall-gui", 300)]);
+        assert!(!saved[0].foreground.as_ref().unwrap().linked);
+    }
+
+    #[test]
+    fn test_terminals_sharing_a_process_record_no_foreground() {
+        let mut p = terminal_with_shell();
+        run_in_foreground(&mut p, 200, &["claude"], "/tmp");
+        let saved = capture(&p, &[terminal_window(100, 1), terminal_window(100, 2)]);
+        assert!(saved.iter().all(|s| s.foreground.is_none()));
+    }
+
+    #[test]
+    fn test_foreground_record_round_trips_and_old_readers_ignore_it() {
+        let mut p = terminal_with_shell();
+        run_in_foreground(&mut p, 200, &["claude"], "/home/synthetic/proj");
+        let saved = capture(&p, &[terminal_window(100, 1)]);
+        let json = serde_json::to_string(&saved).unwrap();
+        let back: Vec<SavedClient> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back[0].foreground, saved[0].foreground);
+        let plain: Vec<Client> = serde_json::from_str(&json).unwrap();
+        assert_eq!(plain[0], saved[0].client);
+        // A malformed record is treated as absent
+        let broken = json.replace("\"linked\":false", "\"linked\":\"x\"");
+        assert_ne!(broken, json);
+        assert!(serde_json::from_str::<Vec<SavedClient>>(&broken).unwrap()[0].foreground.is_none());
+    }
+
+    fn terminal_snapshot(fg_argv: &[&str], linked: bool) -> SavedClient {
+        let mut saved = SavedClient {
+            client: terminal_window(100, 1),
+            argv: Some(vec!["foot".to_string()]),
+            cwd: Some("/home/synthetic/shell-dir".to_string()),
+            foreground: Some(Foreground {
+                pid: 200,
+                argv: fg_argv.iter().map(|s| s.to_string()).collect(),
+                cwd: Some("/home/synthetic/proj".to_string()),
+                linked,
+            }),
+        };
+        saved.client.class = "foot".to_string();
+        saved
+    }
+
+    fn plan_for(dir: &std::path::Path, clients: &[SavedClient], resume: &ResumeConfig, exists: bool) -> Vec<String> {
+        write_clients(dir, clients);
+        std::fs::write(dir.join(EXEC_NAME), "[workspace 1 silent] foot\n").unwrap();
+        let _ = exists;
+        sim_session(dir).prepare_load_with(dir, resume).unwrap().entries.into_iter().map(|e| e.command).collect()
+    }
+
+    #[test]
+    fn test_plan_resumes_claude_in_its_directory_with_a_prompt_afterwards() {
+        let dir = tempfile::tempdir().unwrap();
+        // The recorded directories are synthetic and absent here, so use real ones
+        let proj = dir.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let mut term = terminal_snapshot(&["claude"], false);
+        term.foreground.as_mut().unwrap().cwd = Some(proj.to_str().unwrap().to_string());
+        term.cwd = Some(dir.path().to_str().unwrap().to_string());
+        let commands = plan_for(dir.path(), &[term], &ResumeConfig::default(), true);
+        assert_eq!(commands.len(), 1);
+        let command = &commands[0];
+        assert!(command.starts_with(&format!("cd {} && foot sh -c ", dir.path().display())), "{command}");
+        assert!(command.ends_with(&format!("hyprsession-resume {} 'claude --continue'", proj.display())), "{command}");
+    }
+
+    #[test]
+    fn test_plan_for_a_linked_terminal_is_a_plain_terminal_launch_and_the_app_launches_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut gui = SavedClient { client: gui_window("playcall-gui", 200), argv: Some(vec!["./playcall-gui".into()]), cwd: None, foreground: None };
+        gui.client.workspace.id = 1;
+        let mut term = terminal_snapshot(&["./playcall-gui"], true);
+        term.cwd = None;
+        let commands = plan_for(dir.path(), &[term, gui], &ResumeConfig::default(), true);
+        let mut sorted = commands.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["./playcall-gui".to_string(), "foot".to_string()]);
+    }
+
+    #[test]
+    fn test_plan_follows_the_unlisted_policy_and_user_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("p");
+        std::fs::create_dir(&proj).unwrap();
+        let mk = |argv: &[&str]| {
+            let mut t = terminal_snapshot(argv, false);
+            t.cwd = None;
+            t.foreground.as_mut().unwrap().cwd = Some(proj.to_str().unwrap().to_string());
+            t
+        };
+        // Unlisted, default policy: replay verbatim
+        let c = plan_for(dir.path(), &[mk(&["htop", "-d", "5"])], &ResumeConfig::default(), true);
+        assert!(c[0].ends_with("'htop -d 5'"), "{}", c[0]);
+        // Unlisted, prompt policy: clean prompt
+        let prompt = ResumeConfig::parse("[settings]\nunlisted = \"prompt\"\n", "t").unwrap();
+        assert_eq!(plan_for(dir.path(), &[mk(&["htop"])], &prompt, true), vec!["foot".to_string()]);
+        // A user entry overrides a built-in one
+        let over = ResumeConfig::parse("[resume]\nclaude = \"claude --resume-session x\"\n", "t").unwrap();
+        let c = plan_for(dir.path(), &[mk(&["claude"])], &over, true);
+        assert!(c[0].ends_with("'claude --resume-session x'"), "{}", c[0]);
+    }
+
+    #[test]
+    fn test_plan_degrades_an_unverified_terminal_to_a_clean_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = terminal_snapshot(&["claude"], false);
+        t.argv = Some(vec!["myterm".into()]);
+        t.cwd = None;
+        let config = ResumeConfig::parse("[terminals]\nextra = [\"myterm\"]\n", "t").unwrap();
+        assert_eq!(plan_for(dir.path(), &[t], &config, true), vec!["myterm".to_string()]);
+    }
+
+    #[test]
+    fn test_legacy_snapshots_without_foreground_plan_exactly_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plain = terminal_snapshot(&["x"], false);
+        plain.foreground = None;
+        plain.cwd = None;
+        assert_eq!(plan_for(dir.path(), &[plain], &ResumeConfig::default(), true), vec!["foot".to_string()]);
+    }
+
+    #[test]
+    fn test_a_bad_resume_file_fails_the_plan_before_anything_is_touched() {
+        let err = ResumeConfig::parse("[settings]\nunlisted = 3\n", "/c/resume.toml").unwrap_err();
+        assert!(err.contains("/c/resume.toml:2"), "{err}");
+    }
+
+    #[test]
+    fn test_save_load_save_fixed_point_with_a_resumed_foreground_program() {
+        let resume = ResumeConfig::default();
+        // Save 1: foot running claude in a project directory, shell cd'd elsewhere
+        let mut before_proc = terminal_with_shell();
+        run_in_foreground(&mut before_proc, 200, &["claude"], "/home/synthetic/proj");
+        let save1 = SavedClient::capture_all(&[terminal_window(100, 1)], &before_proc, &resume);
+
+        // Load: what the planner would launch for the terminal...
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("proj");
+        std::fs::create_dir(&proj).unwrap();
+        let mut planned = save1.clone();
+        planned[0].foreground.as_mut().unwrap().cwd = Some(proj.to_str().unwrap().to_string());
+        let command = plan_for(dir.path(), &planned, &resume, true).remove(0);
+        // ...and the process tree the compositor then shows: the terminal's argv carries the wrapper,
+        // and the program runs as its resume command
+        let words: Vec<String> = shell_words(&command);
+        let mut after_proc = FakeProc::default();
+        after_proc.add(1, 0, 1, 1, 0, -1, &["init"], "/");
+        let terminal_argv: Vec<&str> = words.iter().skip_while(|w| *w != "foot").map(String::as_str).collect();
+        after_proc.add(500, 1, 500, 500, 0, -1, &terminal_argv, "/home/synthetic/shell-dir");
+        after_proc.add(501, 500, 501, 501, 9, 502, &["sh"], proj.to_str().unwrap());
+        after_proc.add(502, 501, 502, 501, 9, 502, &["claude", "--continue"], proj.to_str().unwrap());
+        let save2 = SavedClient::capture_all(&[terminal_window(500, 1)], &after_proc, &resume);
+
+        // The terminal's recorded argv is its own again, never the wrapper
+        assert_eq!(save2[0].argv, Some(vec!["foot".to_string()]));
+        // Same layout, argv and relaunch plan, even though the program's argv changed
+        let mut expected = save1.clone();
+        expected[0].foreground.as_mut().unwrap().cwd = Some(proj.to_str().unwrap().to_string());
+        assert_eq!(fingerprint(&save2), fingerprint(&expected));
+        // The relaunch plan is the same too; the only drift is the terminal's own directory, which
+        // is now the shell's (the program's directory) rather than where the first shell had cd'd
+        let command2 = plan_for(dir.path(), &save2, &resume, true).remove(0);
+        let wrapper = |c: &str| c[c.find("foot sh -c").unwrap()..].to_string();
+        assert_eq!(wrapper(&command2), wrapper(&command));
+    }
+
+    /// Split a shell command line into words (single quotes only, as shell_quote produces)
+    fn shell_words(line: &str) -> Vec<String> {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("for a in {line}; do printf '%s\\0' \"$a\"; done"))
+            .output()
+            .unwrap();
+        crate::command_detection::parse_cmdline(&out.stdout)
     }
 }

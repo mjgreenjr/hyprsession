@@ -454,3 +454,55 @@ mod workspace_flag_tests {
         assert!(String::from_utf8_lossy(&out.stderr).contains("1 or more"));
     }
 }
+
+mod resume_file_tests {
+    use std::process::Command;
+
+    #[test]
+    fn test_simulate_surfaces_a_bad_resume_file_naming_file_and_line() {
+        let sessions = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let dir = config.path().join("hyprsession");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("resume.toml"), "[settings]\nunlisted = \"sometimes\"\n").unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_hyprsession"))
+            .args(["load", "--simulate", "--dialect", "lua"])
+            .env("HYPRSESSION_PATH", sessions.path())
+            .env("XDG_CONFIG_HOME", config.path())
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains("resume.toml:2"), "{text}");
+    }
+
+    #[test]
+    fn test_simulate_of_a_snapshot_with_a_terminal_foreground_shows_the_relaunch() {
+        let sessions = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let session = sessions.path().join("s");
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("exec.conf"), "[workspace 1 silent] foot\n").unwrap();
+        let client = serde_json::json!({
+            "address": "0x1", "at": [0, 0], "size": [10, 10],
+            "workspace": { "id": 1, "name": "1" }, "floating": false, "fullscreen": 0,
+            "fullscreenClient": 0, "monitor": 0, "initialClass": "foot", "class": "foot",
+            "initialTitle": "t", "title": "t", "pid": 100, "xwayland": false, "pinned": false,
+            "grouped": [], "mapped": true, "swallowing": null, "focusHistoryID": 0,
+            "argv": ["foot"],
+            "foreground": { "pid": 200, "argv": ["claude"], "cwd": project.path(), "linked": false }
+        });
+        std::fs::write(session.join("clients.json"), serde_json::to_vec(&vec![client]).unwrap()).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_hyprsession"))
+            .args(["load", "s", "--simulate", "--dialect", "lua"])
+            .env("HYPRSESSION_PATH", sessions.path())
+            .env("XDG_CONFIG_HOME", config.path())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{text}");
+        assert!(text.contains("running resume command 'claude --continue'"), "{text}");
+        assert!(text.contains("hyprsession-resume"), "{text}");
+    }
+}

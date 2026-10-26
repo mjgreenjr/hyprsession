@@ -8,6 +8,8 @@ pub mod command_detection;
 pub mod command_faker;
 pub mod dispatch;
 pub mod load;
+pub mod procfs;
+pub mod resume;
 pub mod legacy;
 pub mod session;
 
