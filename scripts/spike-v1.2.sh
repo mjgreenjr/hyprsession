@@ -8,7 +8,8 @@
 #
 # Commands:  preflight | build | baseline | proto | proto-focus | export-fixture SNAP OUT | all | cleanup | selftest
 # Spike #2 (split-target rule + computed insertion order; see docs/v1.2-plan.md, "Spike #2"):
-#            rule | shape-insert NAME N | shape-hand NAME N | computed NAME | bar | spike2
+#            rule | shape-insert NAME N | shape-hand NAME N | computed NAME [steer] | bar | spike2
+# Unfloat variant (the user's own technique: float, hover, unfloat):  unfloat NAME [hidden|visible] | unfloat-bar
 # See docs/v1.2-plan.md ("The spike") for what to run and what to paste back.
 #
 # Requires: hyprctl, jq, foot, a built hyprsession binary ($HYPRSESSION, default
@@ -32,6 +33,7 @@ REPORT="$DIR/report.txt"
 RUNS="$DIR/runs"
 MODEL="$(cd "$(dirname "$0")" && pwd)/dwindle_model.py"
 POINTER_MODE="${SPIKE_POINTER:-auto}"     # auto: try to warp the pointer, else ask you; manual: always ask; ignore: only log it
+ALLOW_SWITCH="${SPIKE_ALLOW_SWITCH:-0}"   # unfloat visible mode switches to the scratch workspace and back (DEC-B relaxed, conditional)
 ALLOW_POINTER="${SPIKE_ALLOW_POINTER:-0}" # computed ... steer warps the pointer before every move (new side effect: needs a ruling)
 
 log() { printf '%s\n' "$*" | tee -a "$REPORT" >&2; }
@@ -570,6 +572,122 @@ computed() { # name [plain|steer]
   else log "RESULT computed[$name,$mode]: FAIL — diff(saved, reproduced):"; printf '%s\n' "$d" | sed 's/^/     /' | tee -a "$REPORT" >&2; fi
 }
 
+# ---------------------------------------------------------------- unfloat variant
+# The user's own way of growing a tree: a window is toggled floating, the pointer is put over the
+# leaf to split, and the window is unfloated; the unfloat insertion splits the leaf under the pointer.
+# Prototype: launch the shape's windows, make them floating, move them onto the scratch workspace
+# (floating windows are not tree nodes), then unfloat them in the steer schedule's order, warping the
+# pointer into the target leaf's current box before each unfloat.
+
+dsp_float() { # address enable|disable: set the floating state (no-op when already there)
+  local cur want=false
+  [ "$2" = enable ] && want=true
+  cur="$(hyprctl clients -j | jq -r --arg a "$1" '.[] | select(.address == $a) | .floating')"
+  [ "$cur" = "$want" ] && return 0
+  detect_dialect
+  if [ "$DIALECT" = lua ]; then hyprctl dispatch "hl.dsp.window.float({ action = '$2', window = 'address:$1' })" >/dev/null
+  else hyprctl dispatch togglefloating "address:$1" >/dev/null; fi
+}
+
+table_tsv_tiled() { # like table_tsv, tiled windows only (floating ones are not tree nodes)
+  local pid x y w h
+  clients_on "$WS" | jq -r '.[] | select(.floating == false) | "\(.pid)\t\(.at[0])\t\(.at[1])\t\(.size[0])\t\(.size[1])"' |
+    while IFS=$'\t' read -r pid x y w h; do printf '%s\t%s\t%s\t%s\t%s\n' "$(tag "$pid")" "$x" "$y" "$w" "$h"; done
+}
+
+place_pointer() { # x y : warp, or ask the user (with screen fractions) when warping is not accepted
+  if [ "$POINTER_MODE" != manual ] && warp_pointer "$1" "$2"; then return 0; fi
+  local frac
+  frac="$(hyprctl monitors -j | jq -r --argjson x "$1" --argjson y "$2" '.[] | select(.focused) |
+      "\(((($x - .x) * 100 / .width) | floor))% across, \(((($y - .y) * 100 / .height) | floor))% down"')"
+  printf 'spike: put the mouse pointer at %s,%s (%s of the screen), then press Enter ' "$1" "$2" "$frac" >&2
+  read -r _ </dev/tty || true
+}
+
+unfloat() { # name [hidden|visible]
+  rule_runs
+  local name="$1" mode="${2:-hidden}" src="shape-$1" tag_="unfloat-$1-${2:-hidden}"
+  [ "$ALLOW_POINTER" = 1 ] || die "unfloat moves your mouse pointer; set SPIKE_ALLOW_POINTER=1"
+  if [ "$mode" = visible ]; then
+    [ "$ALLOW_SWITCH" = 1 ] || die "visible mode switches to workspace $WS and back; set SPIKE_ALLOW_SWITCH=1"
+  fi
+  [ -f "$SESS/$src/clients.json" ] || die "no snapshot $src"
+  local order_file="$DIR/order-$tag_.txt" lines=() targets=() line a i start_ws before="$DIR/before.txt" ptr0
+  python3 "$MODEL" steer "$SESS/$src/clients.json" "$WS" >"$order_file" || true
+  log "== unfloat[$name,$mode]: $(head -1 "$order_file")"
+  mapfile -t lines < <(grep -v -e '^MODE' -e '^POINTER' "$order_file")
+  mapfile -t targets < <(grep '^POINTER' "$order_file" | sed 's/^POINTER //')
+  [ "${#lines[@]}" -gt 0 ] || die "empty order for $name"
+  ptr0="$(ptr)"; start_ws="$(active_ws)"
+  close_ws
+  local addrs=()
+  for line in "${lines[@]}"; do
+    all_addresses >"$before"; dsp_exec "${line#* * }"
+    a="$(wait_for_new "$before" 20)" || die "window for '${line#* * }' did not appear"
+    dsp_float "$a" enable          # floats where it was born, on the visible workspace
+    dsp_move "$a" "$WS"            # a floating window joins no tree
+    addrs+=("$a"); sleep 0.3
+  done
+  local floating; floating="$(clients_on "$WS" | jq '[.[] | select(.floating == true)] | length')"
+  [ "$floating" -eq "${#lines[@]}" ] || log "  !! only $floating of ${#lines[@]} windows are floating on workspace $WS before the unfloats (run unreliable)"
+  [ "$(clients_on "$WS" | jq '[.[] | select(.floating == false)] | length')" -eq 0 ] || log "  !! tiled windows already on workspace $WS before the unfloats (run unreliable)"
+  local rd="$RUNS/$tag_" tags=() pointers=() step=0
+  rm -rf "$rd"; mkdir -p "$rd"
+  if [ "$mode" = visible ]; then
+    dsp_workspace "$WS"; sleep 0.5
+    log "  VISIBLE MODE: switched the visible workspace from $start_ws to $WS (DEC-B relaxed, conditional on need)"
+  fi
+  for i in "${!lines[@]}"; do
+    step=$((step + 1))
+    if [ "$i" -ge 1 ]; then
+      local t="${targets[$((i - 1))]}"
+      place_pointer "${t% *}" "${t#* }"
+      pointers+=("$(ptr)")
+    fi
+    log "  [$tag_] step $step: unfloat #$step (${lines[$i]#* * })  pointer=$(ptr)"
+    dsp_float "${addrs[$i]}" disable
+    sleep "$STEP_PAUSE"
+    table_tsv_tiled >"$rd/t$step.tsv"
+    tags+=("$(tag "$(clients_on "$WS" | jq -r --arg a "${addrs[$i]}" '.[] | select(.address == $a) | .pid')")")
+    dump_ws "after unfloating #$step"
+  done
+  if [ "$mode" = visible ]; then
+    dsp_workspace "$start_ws"; sleep 0.5
+    log "  VISIBLE MODE: switched back to workspace $start_ws"
+  fi
+  [ "$ptr0" = "?" ] || place_pointer "${ptr0%,*}" "${ptr0#*,}" || true
+  jq -n --arg label "$tag_" --arg order "${tags[*]}" --arg pointers "${pointers[*]:-}" '
+    {label: $label, order: ($order | split(" ")), mode: "unfloat",
+     pointers: ($pointers | split(" ") | map(select(. != "?") | split(",") | map(tonumber)))}' >"$rd/meta.json"
+  python3 "$MODEL" derive "$rd" --out "$RUNS/unfloat.jsonl" | tee -a "$REPORT" >&2
+  sleep 1; save "$tag_"
+  local d; d="$(diff_report "$SESS/$src/clients.json" "$SESS/$tag_/clients.json" "$WS")"
+  if [ "$d" = EMPTY ]; then log "RESULT unfloat[$name,$mode]: PASS (first-cycle diff EMPTY)"
+  else log "RESULT unfloat[$name,$mode]: FAIL — diff(saved, reproduced):"; printf '%s\n' "$d" | sed 's/^/     /' | tee -a "$REPORT" >&2; fi
+}
+
+# Hidden mode first on s4 (control), s3l and h5; visible mode only for the ones that failed hidden
+unfloat_bar() {
+  rule_runs
+  [ "$ALLOW_POINTER" = 1 ] || die "unfloat moves your mouse pointer; set SPIKE_ALLOW_POINTER=1"
+  local name failed=()
+  for name in s4 s3l h5; do
+    [ -f "$SESS/shape-$name/clients.json" ] || { log "unfloat-bar: no snapshot shape-$name (run bar first), skipped"; continue; }
+    unfloat "$name" hidden
+    grep -q "^RESULT unfloat\[$name,hidden\]: PASS" "$REPORT" || failed+=("$name")
+  done
+  if [ "${#failed[@]}" -gt 0 ]; then
+    if [ "$ALLOW_SWITCH" = 1 ]; then
+      log "-- hidden mode failed for: ${failed[*]}; trying visible mode (switches workspace and back)"
+      for name in "${failed[@]}"; do unfloat "$name" visible; done
+    else
+      log "-- hidden mode failed for: ${failed[*]}; visible mode needs SPIKE_ALLOW_SWITCH=1 (switches to workspace $WS and back)"
+    fi
+  fi
+  log "== unfloat-bar summary"
+  grep -E '^RESULT unfloat' "$REPORT" | tee -a "$REPORT.summary" >&2 || true
+}
+
 # The pre-stated success bar: first-cycle diff EMPTY for each of these shapes.
 bar() {
   rule_runs
@@ -592,6 +710,7 @@ bar() {
   printf 'spike: switch to workspace %s (empty), then press Enter ' "$WS" >&2; read -r _ </dev/tty || true
   shape_hand h5 5
   park_pointer BL; computed h5 plain; [ "$ALLOW_POINTER" = 1 ] && computed h5 steer
+  [ "$ALLOW_POINTER" = 1 ] && unfloat_bar
   log "== bar summary"
   grep -E '^RESULT' "$REPORT" | tee -a "$REPORT.summary" >&2 || true
 }
@@ -611,8 +730,10 @@ case "${1:-}" in
   shape-hand) shape_hand "${2:?name}" "${3:?n}" ;;
   computed) computed "${2:?name}" "${3:-plain}" ;;
   bar) bar ;;
+  unfloat) unfloat "${2:?name}" "${3:-hidden}" ;;
+  unfloat-bar) unfloat_bar ;;
   spike2) spike2 ;;
   cleanup) cleanup ;;
   selftest) selftest ;;
-  *) sed -n '2,24p' "$0"; exit 2 ;;
+  *) sed -n '2,26p' "$0"; exit 2 ;;
 esac

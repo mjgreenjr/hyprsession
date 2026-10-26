@@ -11,7 +11,7 @@ Geometry is topological: windows are compared by tree shape (orientation and chi
 pixel equality, because gaps and rounding make rectangles differ by a few pixels.
 
 Subcommands (all print to stdout; exit code 3 means "no exact order exists"):
-  derive RUNDIR              analyse a recorded run (tables t<k>.tsv + meta.json), append to rule.jsonl
+  derive RUNDIR [--out F]    analyse a recorded run (tables t<k>.tsv + meta.json), append to rule.jsonl (or F)
   score  RULE_JSONL          score every hypothesis against all recorded runs
   tree   CLIENTS_JSON WS     print the tree reconstructed from a snapshot's tiled windows on WS
   order  CLIENTS_JSON WS RULE [--pointer X,Y]
@@ -283,7 +283,9 @@ def cmd_derive(args):
     run["targets"] = targets
     run["final"] = {str(order.index(t) + 1): list(r) for t, r in final.items()}
     run["box"] = list(layout_box(list(final.items())))
-    with open(os.path.join(os.path.dirname(rundir.rstrip("/")), "rule.jsonl"), "a") as f:
+    out = args[args.index("--out") + 1] if "--out" in args else \
+        os.path.join(os.path.dirname(rundir.rstrip("/")), "rule.jsonl")
+    with open(out, "a") as f:
         f.write(json.dumps(run) + "\n")
     print(f"RUN {meta['label']}: n={len(order)} insertion order={','.join(order)} "
           f"split targets T={targets} pointers={meta.get('pointers')}")
