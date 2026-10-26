@@ -147,19 +147,37 @@ fn rules_from_client(client: &Client) -> ExecRules {
     }
 }
 
-/// Launch entries for a new-format snapshot, built from the recorded argv: the argv
-/// shell-joined, one entry per distinct command string, with rules taken from the
-/// first saved window that carries that command. Windows without argv cannot be
-/// launched and are skipped (they are still placed if their app brings them up).
+/// The command line recorded for a saved window. A single-element argv is already a
+/// complete command line (Chromium-family processes present /proc cmdline as one
+/// space-joined string, quotes and all), so it is used verbatim; several elements are
+/// shell-joined with quoting.
+fn command_from_saved_argv(argv: &[String]) -> Option<String> {
+    match argv {
+        [] => None,
+        [line] if line.trim().is_empty() => None,
+        [line] => Some(line.clone()),
+        argv => Some(shell_join(argv)),
+    }
+}
+
+/// Launch entries for a new-format snapshot, built from the recorded argv. Windows are
+/// grouped by command; each distinct pid in a group is one launch (identical commands
+/// in separate processes are separate launches, windows sharing a process are one),
+/// with rules taken from the group's first saved window. Windows without argv cannot
+/// be launched and are skipped (they are still placed if their app brings them up).
 pub fn launch_entries_from_saved(saved: &[SavedClient]) -> Vec<ExecEntry> {
     let mut entries: Vec<ExecEntry> = vec![];
+    let mut group_rules: std::collections::HashMap<String, ExecRules> = Default::default();
+    let mut launched: HashSet<(String, i32)> = HashSet::new();
     for window in saved {
-        let Some(argv) = window.argv.as_ref().filter(|a| !a.is_empty()) else { continue };
-        let command = shell_join(argv);
-        if entries.iter().any(|e| e.command == command) {
-            continue;
+        let Some(command) = window.argv.as_deref().and_then(command_from_saved_argv) else { continue };
+        let rules = group_rules
+            .entry(command.clone())
+            .or_insert_with(|| rules_from_client(&window.client))
+            .clone();
+        if launched.insert((command.clone(), window.client.pid)) {
+            entries.push(ExecEntry { rules, command });
         }
-        entries.push(ExecEntry { rules: rules_from_client(&window.client), command });
     }
     entries
 }
@@ -624,6 +642,49 @@ mod tests {
         assert_eq!(entries[0].rules.workspace, Some(RuleWorkspace::Id(5)));
         assert!(!entries[0].rules.float);
         assert_eq!(entries[1].rules.at, Some((3, 4)));
+    }
+
+    fn saved_pid(class: &str, argv: &[&str], pid: i32, at: (i16, i16)) -> SavedClient {
+        let mut window = saved(class, Some(argv), 1, false, at);
+        window.client.pid = pid;
+        window
+    }
+
+    #[test]
+    fn test_single_element_argv_is_used_verbatim() {
+        // Chromium-family cmdline: one space-joined string with shell quotes embedded
+        let blob = r#"/opt/electronmail/electron-mail --class=electron-mail --name="Electron Mail" --user-data-dir='/home/x/em data'"#;
+        let entries = launch_entries_from_saved(&[saved_pid("electron-mail", &[blob], 7, (0, 0))]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command, blob);
+        // Multi-element argv is still shell-joined
+        let entries = launch_entries_from_saved(&[saved_pid("x", &["a b", "c"], 8, (0, 0))]);
+        assert_eq!(entries[0].command, "'a b' c");
+        // A blank single element is not a command
+        assert!(launch_entries_from_saved(&[saved_pid("x", &["  "], 9, (0, 0))]).is_empty());
+    }
+
+    #[test]
+    fn test_same_command_in_separate_processes_is_launched_per_pid() {
+        let entries = launch_entries_from_saved(&[
+            saved_pid("foot", &["foot"], 101, (0, 0)),
+            saved_pid("foot", &["foot"], 102, (10, 0)),
+            saved_pid("foot", &["foot"], 103, (20, 0)),
+        ]);
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().all(|e| e.command == "foot"));
+        // Rules come from the group's first window
+        assert!(entries.iter().all(|e| e.rules.at == Some((0, 0))));
+    }
+
+    #[test]
+    fn test_two_windows_of_one_pid_are_one_launch() {
+        let entries = launch_entries_from_saved(&[
+            saved_pid("brave", &["brave --profile-directory=Default"], 55, (0, 0)),
+            saved_pid("brave", &["brave --profile-directory=Default"], 55, (30, 0)),
+            saved_pid("brave", &["brave --profile-directory=Default"], 56, (60, 0)),
+        ]);
+        assert_eq!(entries.len(), 2);
     }
 
     #[test]
