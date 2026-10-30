@@ -1128,6 +1128,97 @@ mod tests {
         assert!(err.contains("/c/resume.toml:2"), "{err}");
     }
 
+    /// The process tree the compositor shows for a terminal launched with `command` (a planned
+    /// wrapped launch): the terminal's argv carries the wrapper, and the wrapper `sh` is the
+    /// terminal's shell, running the program as a child *in its own process group* (a
+    /// non-interactive shell has no job control, so nothing becomes the tty's foreground group)
+    fn wrapped_terminal_tree(command: &str, cwd: &str, program: &[&str]) -> FakeProc {
+        // the launch may be prefixed with `cd <dir> &&`; the process tree starts at the terminal
+        let words = shell_words(&command[command.find("foot").unwrap()..]);
+        let terminal_argv: Vec<&str> = words.iter().skip_while(|w| *w != "foot").map(String::as_str).collect();
+        let mut p = FakeProc::default();
+        p.add(1, 0, 1, 1, 0, -1, &["init"], "/");
+        p.add(500, 1, 500, 500, 0, -1, &terminal_argv, "/home/synthetic/shell-dir");
+        p.add(501, 500, 501, 501, 9, 501, &terminal_argv[1..], cwd);
+        p.add(502, 501, 501, 501, 9, 501, program, cwd);
+        p
+    }
+
+    #[test]
+    fn test_wrapper_terminal_records_its_resume_and_survives_a_second_generation() {
+        let resume = ResumeConfig::default();
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("playcall-gui");
+        std::fs::create_dir(&proj).unwrap();
+        let proj = proj.to_str().unwrap();
+
+        // Generation 1: a load launched the terminal with the resume wrapper
+        let mut seed = terminal_snapshot(&["claude"], false);
+        seed.cwd = None;
+        seed.foreground.as_mut().unwrap().cwd = Some(proj.to_string());
+        let command1 = plan_for(dir.path(), &[seed], &resume, true).remove(0);
+        let tree = wrapped_terminal_tree(&command1, proj, &["claude", "--continue"]);
+
+        // Save: the probe sees only "the shell" (no foreground group), yet the resume is recorded
+        let save = SavedClient::capture_all(&[terminal_window(500, 1)], &tree, &resume);
+        assert_eq!(save[0].argv, Some(vec!["foot".to_string()]), "the terminal itself, never the wrapper");
+        let fg = save[0].foreground.as_ref().expect("wrapper terminal must record a foreground");
+        assert_eq!(fg.argv, vec!["claude", "--continue"]);
+        assert_eq!(fg.cwd.as_deref(), Some(proj));
+        assert!(!fg.linked);
+
+        // ...so the next load dispatches the same resume in the same directory
+        let command2 = plan_for(dir.path(), &save, &resume, true).remove(0);
+        let wrapper = |c: &str| c[c.find("foot sh -c").unwrap()..].to_string();
+        assert_eq!(wrapper(&command2), wrapper(&command1));
+
+        // Second generation: that load's terminal records identically at the next save
+        let tree2 = wrapped_terminal_tree(&command2, proj, &["claude", "--continue"]);
+        let save2 = SavedClient::capture_all(&[terminal_window(500, 1)], &tree2, &resume);
+        assert_eq!(save2[0].foreground, save[0].foreground);
+        assert_eq!(fingerprint(&save2), fingerprint(&save));
+    }
+
+    #[test]
+    fn test_wrapper_terminal_whose_program_has_ended_records_no_resume() {
+        // The wrapper exec'd the user's shell once the program exited: no marker left in the shell's argv
+        let resume = ResumeConfig::default();
+        let mut p = FakeProc::default();
+        p.add(1, 0, 1, 1, 0, -1, &["init"], "/");
+        p.add(500, 1, 500, 500, 0, -1, &["foot", "sh", "-c", "s", "hyprsession-resume", "/p", "claude --continue"], "/");
+        p.add(501, 500, 501, 501, 9, 501, &["-zsh"], "/p");
+        let save = SavedClient::capture_all(&[terminal_window(500, 1)], &p, &resume);
+        assert_eq!(save[0].foreground, None);
+        assert_eq!(save[0].argv, Some(vec!["foot".to_string()]));
+    }
+
+    #[test]
+    fn test_wrapper_terminal_keeps_the_guards() {
+        let resume = ResumeConfig::default();
+        // hyprsession itself running under the wrapper shell is not a program to bring back
+        let mut p = FakeProc::default();
+        p.add(1, 0, 1, 1, 0, -1, &["init"], "/");
+        p.add(500, 1, 500, 500, 0, -1, &["foot"], "/");
+        p.add(501, 500, 501, 501, 9, 501, &["sh", "-c", "s", "hyprsession-resume", "/p", "hyprsession save x"], "/p");
+        p.add(502, 501, 501, 501, 9, 501, &["hyprsession", "save", "x"], "/p");
+        p.own = 502;
+        assert_eq!(SavedClient::capture_all(&[terminal_window(500, 1)], &p, &resume)[0].foreground, None);
+        // two shells in one terminal process: ambiguous, nothing recorded
+        let mut p = FakeProc::default();
+        p.add(1, 0, 1, 1, 0, -1, &["init"], "/");
+        p.add(500, 1, 500, 500, 0, -1, &["foot"], "/");
+        p.add(501, 500, 501, 501, 9, 501, &["sh", "-c", "s", "hyprsession-resume", "/p", "claude"], "/p");
+        p.add(503, 500, 503, 503, 10, 503, &["-zsh"], "/p");
+        assert_eq!(SavedClient::capture_all(&[terminal_window(500, 1)], &p, &resume)[0].foreground, None);
+        // a resumed program that owns another saved window is linked, not relaunched in the terminal
+        let mut p = wrapped_terminal_tree("foot sh -c s hyprsession-resume /p brave", "/p", &["brave"]);
+        p.procs.get_mut(&502).unwrap().stat.pgrp = 501;
+        let mut browser = terminal_window(502, 2);
+        browser.class = "brave".into(); browser.initial_class = "brave".into();
+        let save = SavedClient::capture_all(&[terminal_window(500, 1), browser], &p, &resume);
+        assert!(save[0].foreground.as_ref().unwrap().linked);
+    }
+
     #[test]
     fn test_save_load_save_fixed_point_with_a_resumed_foreground_program() {
         let resume = ResumeConfig::default();

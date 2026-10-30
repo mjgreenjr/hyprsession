@@ -174,6 +174,28 @@ pub fn capture_terminal(proc: &dyn ProcFs, table: &ProcTable, terminal_pid: i32)
     let mut capture = TerminalCapture { shell_cwd: proc.cwd(shell), ..Default::default() };
     let Some(shell_stat) = table.stats.get(&shell) else { return capture };
 
+    // A terminal relaunched by hyprsession runs its resumed program under a non-interactive
+    // `sh -c` wrapper without job control: the program shares the wrapper's process group, so
+    // the foreground probe below sees "the shell". While the wrapper is still the terminal's
+    // shell the program is running, and the wrapper's own arguments name it. (Once the program
+    // ends the wrapper execs the user's shell, whose argv carries no marker: nothing recorded.)
+    if let Some((cwd, command)) = proc.argv(shell).as_deref().and_then(crate::resume::wrapper_program) {
+        let descendants = table.descendants(shell);
+        if descendants.contains(&proc.own_pid()) {
+            return capture;
+        }
+        let mut group_pids = vec![shell];
+        group_pids.extend(descendants.iter().copied().filter(|p| table.stats.get(p).is_some_and(|s| s.pgrp == shell_stat.pgrp)));
+        capture.foreground = Some(ForegroundCapture {
+            pid: shell,
+            argv: crate::command_detection::shell_split(&command),
+            cwd: Some(cwd),
+            descendant_pids: descendants,
+            group_pids,
+        });
+        return capture;
+    }
+
     // The shell holding the foreground itself means nothing else is running
     let fg_group = shell_stat.tpgid;
     if fg_group <= 0 || fg_group == shell_stat.pgrp {

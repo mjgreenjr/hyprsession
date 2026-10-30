@@ -424,6 +424,20 @@ impl Placer {
 
     /// `assign`, also naming the claimed saved client's index in the plan
     pub fn assign_indexed(&mut self, live: &Client) -> Option<(usize, Client)> {
+        self.assign_bound(live, &[], &HashSet::new())
+    }
+
+    /// Claim with launch identity. A window that a launch entry just spawned belongs to that
+    /// entry's saved windows (`own`): they are tried first, whatever the window's transient
+    /// title (a fresh terminal wears a generic title until its program retitles it, so
+    /// identical titles cannot tell entries apart). Saves in `reserved` belong to other
+    /// launches and are only taken when nothing else fits.
+    pub fn assign_bound(
+        &mut self,
+        live: &Client,
+        own: &[usize],
+        reserved: &HashSet<usize>,
+    ) -> Option<(usize, Client)> {
         if self.targets.iter().any(|t| t.matched.as_ref() == Some(&live.address)) {
             return None;
         }
@@ -431,11 +445,17 @@ impl Placer {
             t.matched.is_none()
                 && (t.saved.class == live.class || t.saved.initial_class == live.initial_class)
         };
-        let index = self
-            .targets
-            .iter()
-            .position(|t| same_class(t) && t.saved.title == live.title)
-            .or_else(|| self.targets.iter().position(same_class))?;
+        let pick = |allowed: &dyn Fn(usize) -> bool| {
+            let fits = |i: usize, t: &Target| allowed(i) && same_class(t);
+            self.targets
+                .iter()
+                .enumerate()
+                .position(|(i, t)| fits(i, t) && t.saved.title == live.title)
+                .or_else(|| self.targets.iter().enumerate().position(|(i, t)| fits(i, t)))
+        };
+        let index = pick(&|i| own.contains(&i))
+            .or_else(|| pick(&|i| !reserved.contains(&i)))
+            .or_else(|| pick(&|_| true))?;
         self.targets[index].matched = Some(live.address.clone());
         Some((index, self.targets[index].saved.clone()))
     }
@@ -770,7 +790,31 @@ struct LoadState<'a> {
     queue: PlacementQueue,
     /// In a scoped load, every window outside the loaded workspace: never claimed, moved or reported
     protected: HashSet<Address>,
+    /// Saved windows that a resume launch (a terminal under the hyprsession wrapper) will bring up
+    reserved: HashSet<usize>,
     report: LoadReport,
+}
+
+/// The launch entry whose window(s) are being waited for: windows that were not there
+/// before it ran are its own and bind to its saved windows
+#[derive(Clone, Copy)]
+struct Phase<'a> {
+    before: &'a HashSet<Address>,
+    own: &'a [usize],
+}
+
+/// Entries that run a resumed program under the wrapper identify their window by what they
+/// were asked to run, not by its title
+fn is_resume_entry(entry: &ExecEntry) -> bool {
+    entry.command.contains(crate::resume::WRAPPER_MARKER)
+}
+
+/// The saved windows a spawned window is bound to: only a resume launch binds by identity
+fn own_saves(entry: &ExecEntry) -> &[usize] {
+    match &entry.group {
+        Some(group) if is_resume_entry(entry) => &group.saved,
+        _ => &[],
+    }
 }
 
 /// Read `key` as the first integer of its value ("12", "12,12,12,12" or "12 12 12 12")
@@ -881,10 +925,14 @@ fn flush_all(host: &dyn Host, st: &mut LoadState) {
 
 /// Place every live window that claims a saved client; returns the windows claimed now.
 /// Tiled claims are held and placed together once their workspace is ready.
-fn place_live(host: &dyn Host, st: &mut LoadState, live: &[Client]) -> Vec<Address> {
+fn place_live(host: &dyn Host, st: &mut LoadState, live: &[Client], phase: Option<Phase>) -> Vec<Address> {
     let mut claimed = vec![];
     for window in live.iter().filter(|c| c.mapped && !st.protected.contains(&c.address)) {
-        if let Some((saved_index, wanted)) = st.placer.assign_indexed(window) {
+        let own: &[usize] = match phase {
+            Some(p) if !p.before.contains(&window.address) => p.own,
+            _ => &[],
+        };
+        if let Some((saved_index, wanted)) = st.placer.assign_bound(window, own, &st.reserved) {
             if st.queue.holds(&wanted) {
                 st.queue.hold(Held { saved_index, saved: wanted, live: window.address.clone() });
             } else {
@@ -904,6 +952,7 @@ fn settle_group(
     host: &dyn Host,
     st: &mut LoadState,
     before: &HashSet<Address>,
+    own: &[usize],
     expected: usize,
     claimed: &mut usize,
 ) {
@@ -912,7 +961,7 @@ fn settle_group(
         host.pause();
         stable += 1;
         let Ok(live) = host.clients() else { continue };
-        let new = place_live(host, st, &live).into_iter().filter(|a| !before.contains(a)).count();
+        let new = place_live(host, st, &live, Some(Phase { before, own })).into_iter().filter(|a| !before.contains(a)).count();
         if new > 0 {
             *claimed += new;
             stable = 0;
@@ -933,7 +982,8 @@ fn fulfil_group(
     mut claimed: usize,
 ) {
     let expected = group.saved.len();
-    settle_group(host, st, before, expected, &mut claimed);
+    let own = own_saves(entry);
+    settle_group(host, st, before, own, expected, &mut claimed);
     let mut reinvocations = 0;
     if claimed > 0 {
         let bound = expected.saturating_sub(claimed);
@@ -943,7 +993,7 @@ fn fulfil_group(
             if host.send(&Op::Exec(entry.command.clone())).is_err() {
                 break;
             }
-            settle_group(host, st, before, expected, &mut claimed);
+            settle_group(host, st, before, own, expected, &mut claimed);
         }
     }
     if claimed < expected {
@@ -976,6 +1026,11 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
         placer: Placer::new(if plan.place_by_class { plan.saved.clone() } else { vec![] }),
         queue: if plan.place_by_class { PlacementQueue::new(&plan.saved, &plan.entries) } else { PlacementQueue::disabled() },
         protected,
+        reserved: if plan.place_by_class {
+            plan.entries.iter().filter(|e| is_resume_entry(e)).filter_map(|e| e.group.as_ref()).flat_map(|g| g.saved.iter().copied()).collect()
+        } else {
+            HashSet::new()
+        },
         report: LoadReport::default(),
     };
 
@@ -995,7 +1050,11 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
             host.pause();
             let Ok(live) = host.clients() else { continue };
             if plan.place_by_class {
-                claimed += place_live(host, &mut st, &live).into_iter().filter(|a| !before.contains(a)).count();
+                let own = own_saves(entry);
+                claimed += place_live(host, &mut st, &live, Some(Phase { before: &before, own }))
+                    .into_iter()
+                    .filter(|a| !before.contains(a))
+                    .count();
             }
             let new_window = live.iter().find(|c| c.mapped && !before.contains(&c.address));
             if let Some(window) = new_window {
@@ -1019,7 +1078,7 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
             host.pause();
             ticks += 1;
             if let Ok(live) = host.clients() {
-                place_live(host, &mut st, &live);
+                place_live(host, &mut st, &live, None);
             }
         }
         // Nothing claimed may stay held, whatever the workspace's launches did
@@ -2126,5 +2185,107 @@ mod tests {
         let report = run_load(&host, &plan);
         assert_eq!(report.placed, 2);
         assert_eq!(moved(&host).len(), 2);
+    }
+
+    // ---- claim binding: a resume window binds to the entry that spawned it
+
+    /// Five saved terminals that all wear the generic title; the entries are resume launches
+    fn identical_title_terminals(n: usize) -> (Vec<Client>, Vec<ExecEntry>) {
+        let saves: Vec<Client> =
+            (0..n).map(|i| client("foot", "mike@omarchy:~", 1 + i as i32, false, (12, 38), (1896, 1030))).collect();
+        let entries = (0..n)
+            .map(|i| {
+                let mut e = group_entry(&format!("foot {i}"), vec![i]);
+                e.command = format!("foot sh -c script hyprsession-resume /p{i} 'cmd{i}'");
+                e
+            })
+            .collect();
+        (saves, entries)
+    }
+
+    fn foot_window(n: i16) -> Client {
+        let mut c = client("foot", "mike@omarchy:~", 9, false, (50 + n, 0), (1, 1));
+        c.address = hyprland::shared::Address::new(format!("0xf{n:02x}"));
+        c
+    }
+
+    /// (live address, workspace id) of every MoveToWorkspace sent
+    fn moves_to(host: &FakeHost) -> Vec<(String, i32)> {
+        host.sent
+            .borrow()
+            .iter()
+            .filter_map(|o| match o {
+                Op::MoveToWorkspace { window, workspace: crate::dispatch::WorkspaceTarget::Id(id) } => Some((window.to_string(), *id)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_resume_windows_with_identical_titles_bind_to_their_own_entries() {
+        let (saves, mut entries) = identical_title_terminals(5);
+        // launched against saved order, so title/order claiming alone would cross them over;
+        // each launch brings up one generic-titled window, which must land on ITS entry's workspace
+        entries.reverse();
+        let scripts = (0..5).rev().map(|i| vec![(1, foot_window(i))]).collect();
+        let host = FakeHost::new(vec![], scripts);
+        let report = run_load(&host, &plan_for(entries, saves));
+        assert_eq!(report.placed, 5);
+        let mut got = moves_to(&host);
+        got.sort();
+        let want: Vec<(String, i32)> = (0..5).map(|i| (format!("0xf{i:02x}"), 1 + i)).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn test_a_plain_terminal_cannot_take_a_save_reserved_for_a_resume_launch() {
+        // saved order: [resume terminal (ws 1), plain terminal (ws 2)], same title. The plain
+        // terminal's entry is launched FIRST; by title alone it would take save 0 (the resume's).
+        let saves = vec![
+            client("foot", "mike@omarchy:~", 1, false, (12, 38), (1896, 1030)),
+            client("foot", "mike@omarchy:~", 2, false, (12, 38), (1896, 1030)),
+        ];
+        let mut resume = group_entry("foot", vec![0]);
+        resume.command = "foot sh -c script hyprsession-resume /p cmd".into();
+        let plain = group_entry("foot", vec![1]);
+        let host = FakeHost::new(vec![], vec![vec![(1, foot_window(1))], vec![(1, foot_window(0))]]);
+        run_load(&host, &plan_for(vec![plain, resume], saves));
+        let mut got = moves_to(&host);
+        got.sort();
+        // plain entry's window (0xf01) -> ws 2; resume entry's window (0xf00) -> ws 1
+        assert_eq!(got, vec![("0xf00".to_string(), 1), ("0xf01".to_string(), 2)]);
+    }
+
+    #[test]
+    fn test_spawn_binding_holds_when_a_late_retitle_would_have_split_the_titles() {
+        // the resume window retitles itself after the claim: the binding must not care
+        let mut saves = vec![client("foot", "✳ Sennheiser", 1, false, (12, 38), (1896, 1030))];
+        saves.push(client("foot", "mike@omarchy:~", 8, false, (12, 38), (1896, 1030)));
+        let mut sennheiser = group_entry("foot", vec![0]);
+        sennheiser.command = "foot sh -c script hyprsession-resume /home/mike 'claude --continue'".into();
+        let mut other = group_entry("foot", vec![1]);
+        other.command = "foot sh -c script hyprsession-resume /p cmd".into();
+        // the Sennheiser window is still generically titled when it maps
+        let host = FakeHost::new(vec![], vec![vec![(1, foot_window(0))], vec![(1, foot_window(1))]]);
+        run_load(&host, &plan_for(vec![sennheiser, other], saves));
+        let mut got = moves_to(&host);
+        got.sort();
+        assert_eq!(got, vec![("0xf00".to_string(), 1), ("0xf01".to_string(), 8)]);
+    }
+
+    #[test]
+    fn test_placer_bound_claims_prefer_own_then_unreserved_then_anything() {
+        let saves = vec![
+            client("foot", "t", 1, false, (0, 0), (1, 1)),
+            client("foot", "t", 2, false, (0, 0), (1, 1)),
+            client("foot", "t", 3, false, (0, 0), (1, 1)),
+        ];
+        let reserved: HashSet<usize> = [0, 1].into_iter().collect();
+        let mut placer = Placer::new(saves);
+        let w = |n| foot_window(n);
+        // own wins over saved order; then unreserved; then reserved as the last resort
+        assert_eq!(placer.assign_bound(&w(0), &[1], &reserved).unwrap().0, 1);
+        assert_eq!(placer.assign_bound(&w(1), &[], &reserved).unwrap().0, 2);
+        assert_eq!(placer.assign_bound(&w(2), &[], &reserved).unwrap().0, 0);
     }
 }

@@ -264,6 +264,17 @@ pub fn strip_wrapper(argv: &[String], style: Option<ExecStyle>) -> Vec<String> {
     argv[..start].to_vec()
 }
 
+/// The (directory, command) a wrapper process was asked to run: the two words after the
+/// marker in `sh -c <script> MARKER <cwd> <command>`. `None` for any other argv.
+pub fn wrapper_program(argv: &[String]) -> Option<(String, String)> {
+    let marker = argv.iter().position(|a| a == WRAPPER_MARKER)?;
+    let start = marker.checked_sub(3)?;
+    if argv[start] != "sh" || argv[start + 1] != "-c" {
+        return None;
+    }
+    Some((argv.get(marker + 1)?.clone(), argv.get(marker + 2)?.clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

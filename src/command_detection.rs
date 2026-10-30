@@ -69,6 +69,66 @@ pub fn shell_quote(arg: &str) -> String {
     }
 }
 
+/// Split a command line into words as a POSIX shell would for plain words: whitespace
+/// separates, single quotes are literal, double quotes allow backslash escapes, a bare
+/// backslash escapes the next character. The inverse of `shell_join`. No expansion.
+pub fn shell_split(line: &str) -> Vec<String> {
+    let mut words = vec![];
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            '\'' => {
+                in_word = true;
+                for q in chars.by_ref() {
+                    if q == '\'' {
+                        break;
+                    }
+                    word.push(q);
+                }
+            }
+            '"' => {
+                in_word = true;
+                while let Some(q) = chars.next() {
+                    match q {
+                        '"' => break,
+                        '\\' => match chars.next() {
+                            Some(e @ ('"' | '\\' | '$' | '`')) => word.push(e),
+                            Some(e) => {
+                                word.push('\\');
+                                word.push(e);
+                            }
+                            None => word.push('\\'),
+                        },
+                        q => word.push(q),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                if let Some(e) = chars.next() {
+                    word.push(e);
+                }
+            }
+            c => {
+                in_word = true;
+                word.push(c);
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
 /// Join argv into a shell command line, quoting where needed
 pub fn shell_join(argv: &[String]) -> String {
     argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
@@ -169,6 +229,15 @@ mod tests {
         assert_eq!(extract_binary_name("/nix/store/.firefox-wrapped"), ".firefox-wrapped");
     }
     
+    #[test]
+    fn test_shell_split_inverts_shell_join() {
+        let argv: Vec<String> = ["claude", "--continue", "it's a \"q\"", "", "a b", "$x"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(shell_split(&shell_join(&argv)), argv);
+        assert_eq!(shell_split("  claude   --continue "), vec!["claude", "--continue"]);
+        assert_eq!(shell_split(r#"a "b \"c\"" d\ e"#), vec!["a", "b \"c\"", "d e"]);
+        assert!(shell_split("   ").is_empty());
+    }
+
     #[test]
     fn test_parse_cmdline_splits_on_nul() {
         assert_eq!(
