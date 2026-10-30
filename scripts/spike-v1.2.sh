@@ -354,9 +354,18 @@ export_fixture() { # snapshot-name out-file
 preflight_light() {
   need hyprctl; need jq; [ -x "$BIN" ] || die "hyprsession binary not found"
   local active; active="$(active_ws)"
+  [ -n "${START_WS:-}" ] || START_WS="$active"
   if [ "$ACTIVE_CASE" != 1 ]; then
-    [ "$active" != "$WS" ] || die "switch to an empty workspace other than $WS first"
-    [ "$(clients_on "$active" | jq 'length')" -eq 0 ] || die "the visible workspace ($active) must be empty"
+    if [ "$active" = "$WS" ] || [ "$(clients_on "$active" | jq 'length')" -ne 0 ]; then
+      local staging="" cand
+      for cand in 13 14 15 16 17 18; do
+        [ "$cand" = "$WS" ] && continue
+        [ "$(clients_on "$cand" | jq 'length')" -eq 0 ] && { staging="$cand"; break; }
+      done
+      [ -n "$staging" ] || die "no empty staging workspace found (tried 13-18)"
+      log "  preflight: workspace $active is not a usable landing pad; switching you to empty workspace $staging for this stage"
+      dsp_workspace "$staging"; sleep 0.5
+    fi
   fi
 }
 
@@ -389,7 +398,7 @@ near() { awk -v g="$1" -v w="$2" 'BEGIN{split(g,a,",");split(w,b,",");dx=a[1]-b[
 # Quarter points of the focused monitor: TL TR BL BR, and C for the centre
 pointer_target() { # name -> "x y"
   hyprctl monitors -j | jq -r --arg a "$1" '.[] | select(.focused) |
-    (.x) as $x | (.y) as $y | (.width) as $w | (.height) as $h |
+    (.x) as $x | (.y) as $y | (.width / .scale) as $w | (.height / .scale) as $h |
     ({"TL":[0.25,0.25],"TR":[0.75,0.25],"BL":[0.25,0.75],"BR":[0.75,0.75],"C":[0.5,0.5]}[$a]) as $f |
     "\(($x + $w * $f[0]) | floor) \(($y + $h * $f[1]) | floor)"'
 }
@@ -402,14 +411,39 @@ warp_pointer() { # x y -> success if the pointer is now there
   near "$(ptr)" "$1,$2"
 }
 
+in_area() { # NAME -> true when the pointer is parked in that screen area
+  local area="$1" geo p mx my mw mh px py rx ry cx cy
+  geo="$(hyprctl monitors -j | jq -r '.[] | select(.focused) | "\(.x) \(.y) \(((.width / .scale) | floor)) \(((.height / .scale) | floor))"')"
+  p="$(ptr)"; px="${p%,*}"; py="${p#*,}"
+  set -- $geo; mx=$1; my=$2; mw=$3; mh=$4
+  rx=$((px-mx)); ry=$((py-my)); cx=$((mw/2)); cy=$((mh/2))
+  case "$area" in
+    TL) [ "$rx" -lt $((cx-30)) ] && [ "$ry" -lt $((cy-30)) ] ;;
+    TR) [ "$rx" -gt $((cx+30)) ] && [ "$ry" -lt $((cy-30)) ] ;;
+    BL) [ "$rx" -lt $((cx-30)) ] && [ "$ry" -gt $((cy+30)) ] ;;
+    BR) [ "$rx" -gt $((cx+30)) ] && [ "$ry" -gt $((cy+30)) ] ;;
+    C)  [ "$rx" -gt $((cx-150)) ] && [ "$rx" -lt $((cx+150)) ] && [ "$ry" -gt $((cy-150)) ] && [ "$ry" -lt $((cy+150)) ] ;;
+  esac
+}
+
 park_pointer() { # TL|TR|BL|BR|C
   [ "$POINTER_MODE" = ignore ] && { log "  pointer: left where it is ($(ptr))"; return 0; }
   local xy x y how=manual
   xy="$(pointer_target "$1")"; x="${xy% *}"; y="${xy#* }"
   if [ "$POINTER_MODE" = auto ] && warp_pointer "$x" "$y"; then how="warped ($DIALECT dialect)"
   else
-    printf 'spike: put the mouse pointer in the %s part of the screen (around %s,%s), then press Enter ' "$1" "$x" "$y" >&2
-    read -r _ </dev/tty || true
+    printf 'spike: put the mouse pointer in the %s part of the screen (around %s,%s); waiting for it to settle there\n' "$1" "$x" "$y" >&2
+    local where="$1"
+    case "$1" in TL) where="top-left";; TR) where="top-right";; BL) where="bottom-left";; BR) where="bottom-right";; C) where="center";; esac
+    command -v notify-send >/dev/null 2>&1 && notify-send -a spike "spike: park pointer $where" "anywhere in the $where of the screen - hold it there a second and the run continues" || true
+    local tries=0 stable=0
+    while [ "$tries" -lt 240 ]; do
+      if in_area "$1"; then
+        stable=$((stable+1)); [ "$stable" -ge 2 ] && { how="parked (polled)"; break; }
+      else stable=0; fi
+      tries=$((tries+1)); sleep 0.5
+    done
+    [ "$how" = manual ] && how="park TIMEOUT (pointer at $(ptr))"
   fi
   log "  pointer parked at $1 target $x,$y -> now $(ptr) [$how]"
 }
@@ -498,6 +532,7 @@ rule() {
   python3 "$MODEL" score "$RUNS/rule.jsonl" | tee -a "$REPORT" >&2
   python3 "$MODEL" score "$RUNS/rule.jsonl" | sed -n 's/^BEST //p' >"$DIR/rule.best"
   log "== rule done. Paste $REPORT and $RUNS/rule.jsonl back."
+  command -v notify-send >/dev/null 2>&1 && notify-send -a spike "spike: rule done" "report and rule.jsonl are ready to paste back" || true
 }
 
 # A tiled shape built by insertion (reachable under the measured rule at the current pointer)
@@ -515,8 +550,13 @@ shape_hand() { # name n
   need hyprctl; need jq; need foot
   local name="$1" n="$2" k before="$DIR/before.txt"
   mkdir -p "$DIR" "$SESS" "$RUNS" "$DIR/cwd"
-  [ "$(active_ws)" = "$WS" ] || die "switch to workspace $WS (empty) first: this shape is arranged by hand on it"
-  [ "$(clients_on "$WS" | jq 'length')" -eq 0 ] || die "workspace $WS must be empty"
+  if [ "$(clients_on "$WS" | jq 'length')" -ne 0 ]; then
+    log "  workspace $WS still holds the previous stage's windows; clearing them (fixtures only)"
+    close_ws
+  fi
+  local home_ws="${START_WS:-$(active_ws)}"
+  dsp_workspace "$WS"; sleep 0.5
+  [ "$(active_ws)" = "$WS" ] || die "could not switch to workspace $WS"
   for k in $(seq 1 "$n"); do
     mkdir -p "$DIR/cwd/d$k"
     all_addresses >"$before"; dsp_exec "foot --working-directory=$DIR/cwd/d$k"
@@ -524,12 +564,13 @@ shape_hand() { # name n
     sleep 0.3
   done
   printf 'spike: %s foot windows are on workspace %s. Arrange them into the layout you want to test\n' "$n" "$WS" >&2
-  printf '       (focus, move, resize with your usual keys; keep them tiled). Press Enter when done ' >&2
-  read -r _ </dev/tty || true
+  command -v notify-send >/dev/null 2>&1 && notify-send -a spike "spike: arrange $name on workspace $WS" "switch back to workspace $home_ws when done" || true
+  printf '       (focus, move, resize with your usual keys; keep them tiled). Switch back to workspace %s when done; waiting for that now\n' "$home_ws" >&2
+  while [ "$(active_ws)" = "$WS" ]; do sleep 0.5; done
+  sleep 1
   save "shape-$name"
   dump_ws "hand-built shape $name"
-  printf 'spike: now switch to an EMPTY workspace other than %s, then press Enter ' "$WS" >&2
-  read -r _ </dev/tty || true
+  log "  shape $name saved; the next stage moves you off workspace $WS itself"
 }
 
 # Computed insertion order for snapshot shape-NAME, prototyped outside hyprsession.
@@ -600,8 +641,13 @@ place_pointer() { # x y : warp, or ask the user (with screen fractions) when war
   local frac
   frac="$(hyprctl monitors -j | jq -r --argjson x "$1" --argjson y "$2" '.[] | select(.focused) |
       "\(((($x - .x) * 100 / .width) | floor))% across, \(((($y - .y) * 100 / .height) | floor))% down"')"
-  printf 'spike: put the mouse pointer at %s,%s (%s of the screen), then press Enter ' "$1" "$2" "$frac" >&2
-  read -r _ </dev/tty || true
+  printf 'spike: put the mouse pointer at %s,%s (%s of the screen); waiting for it to settle there\n' "$1" "$2" "$frac" >&2
+  command -v notify-send >/dev/null 2>&1 && notify-send -a spike "spike: unfloat pointer" "put the pointer at $frac of the screen; the run continues once it settles" || true
+  local ptries=0
+  while [ "$ptries" -lt 120 ]; do
+    awk -v g="$(ptr)" -v w="$1,$2" 'BEGIN{split(g,a,",");split(w,b,",");dx=a[1]-b[1];dy=a[2]-b[2];exit !(dx*dx+dy*dy<=1600)}' && break
+    ptries=$((ptries+1)); sleep 0.5
+  done
 }
 
 unfloat() { # name [hidden|visible]
@@ -706,13 +752,13 @@ bar() {
   shape_hand s3l 3
   park_pointer BL; computed s3l plain; [ "$ALLOW_POINTER" = 1 ] && computed s3l steer
   log "   h5: any 5-window layout you actually use"
-  [ "$(active_ws)" = "$WS" ] || log "   (switch to workspace $WS, empty, for the next hand-built shape)"
-  printf 'spike: switch to workspace %s (empty), then press Enter ' "$WS" >&2; read -r _ </dev/tty || true
   shape_hand h5 5
   park_pointer BL; computed h5 plain; [ "$ALLOW_POINTER" = 1 ] && computed h5 steer
   [ "$ALLOW_POINTER" = 1 ] && unfloat_bar
   log "== bar summary"
   grep -E '^RESULT' "$REPORT" | tee -a "$REPORT.summary" >&2 || true
+  if [ -n "${START_WS:-}" ]; then dsp_workspace "$START_WS"; log "  returned you to workspace $START_WS"; fi
+  command -v notify-send >/dev/null 2>&1 && notify-send -a spike "spike: bar done" "results are in the report" || true
 }
 
 spike2() { rule; bar; }
