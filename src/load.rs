@@ -5,6 +5,8 @@
 //! tested against a fake one.
 
 use crate::dispatch::{Dispatcher, Op};
+use crate::dwindle;
+use crate::queue::{ws_key, Held, PlacementQueue, WsKey};
 use crate::command_detection::{resolve_desktop_command, shell_join, shell_quote};
 use crate::resume::{program_identity, terminal_style, wrap_terminal_command, Relaunch, ResumeConfig};
 use crate::session::{plan_adjustment, SavedClient};
@@ -417,6 +419,11 @@ impl Placer {
     /// Claim a saved client for a live window; `None` when the window was already
     /// claimed or nothing saved fits it
     pub fn assign(&mut self, live: &Client) -> Option<Client> {
+        self.assign_indexed(live).map(|(_, saved)| saved)
+    }
+
+    /// `assign`, also naming the claimed saved client's index in the plan
+    pub fn assign_indexed(&mut self, live: &Client) -> Option<(usize, Client)> {
         if self.targets.iter().any(|t| t.matched.as_ref() == Some(&live.address)) {
             return None;
         }
@@ -430,7 +437,12 @@ impl Placer {
             .position(|t| same_class(t) && t.saved.title == live.title)
             .or_else(|| self.targets.iter().position(same_class))?;
         self.targets[index].matched = Some(live.address.clone());
-        Some(self.targets[index].saved.clone())
+        Some((index, self.targets[index].saved.clone()))
+    }
+
+    /// Give a claim back (the claimed window vanished before it was placed)
+    pub fn release(&mut self, index: usize) {
+        self.targets[index].matched = None;
     }
 }
 
@@ -465,6 +477,19 @@ pub struct LoadReport {
     pub surplus: Vec<Client>,
     /// Launch groups that produced fewer windows than were saved, even after re-invoking
     pub shortfalls: Vec<GroupShortfall>,
+    /// One entry per workspace whose tiled windows were placed together
+    pub flushes: Vec<FlushReport>,
+}
+
+/// How one workspace's queued tiled windows were ordered
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlushReport {
+    pub workspace: i32,
+    pub windows: usize,
+    /// `None`: placed in the computed dwindle insertion order; `Some(reason)`: saved reading order
+    pub fallback: Option<String>,
+    /// The pointer was somewhere else when the flush ended: the order may not have been reproduced
+    pub pointer_moved: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -484,6 +509,15 @@ pub trait Host {
     fn signal(&self, pid: i32, signal: Signal);
     /// Wait one poll interval
     fn pause(&self);
+    /// The mouse pointer in layout coordinates (read only: the loader never moves it).
+    /// Dwindle splits the leaf nearest the pointer, so the insertion order depends on it.
+    fn cursor_pos(&self) -> Option<(i32, i32)> {
+        None
+    }
+    /// A compositor option such as `general:layout`, as text
+    fn option(&self, _key: &str) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -519,6 +553,14 @@ impl Host for RealHost {
 
     fn pause(&self) {
         std::thread::sleep(std::time::Duration::from_millis(1000 / TICKS_PER_SECOND));
+    }
+
+    fn cursor_pos(&self) -> Option<(i32, i32)> {
+        hyprland::data::CursorPosition::get().ok().map(|c| (c.x as i32, c.y as i32))
+    }
+
+    fn option(&self, key: &str) -> Option<String> {
+        hyprland::keyword::Keyword::get(key).ok().map(|k| k.value.to_string())
     }
 }
 
@@ -721,23 +763,138 @@ fn apply(host: &dyn Host, live: &Client, wanted: &Client) {
     }
 }
 
+/// What a load carries from one poll to the next
+struct LoadState<'a> {
+    plan: &'a LoadPlan,
+    placer: Placer,
+    queue: PlacementQueue,
+    /// In a scoped load, every window outside the loaded workspace: never claimed, moved or reported
+    protected: HashSet<Address>,
+    report: LoadReport,
+}
+
+/// Read `key` as the first integer of its value ("12", "12,12,12,12" or "12 12 12 12")
+fn option_number(host: &dyn Host, key: &str, default: f64) -> f64 {
+    host.option(key)
+        .and_then(|v| v.split(|c: char| !c.is_ascii_digit() && c != '.').find(|p| !p.is_empty()).map(str::to_string))
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(default)
+}
+
+/// The order in which a workspace's saved tiled windows (`rects`, in plan order) are to be
+/// inserted: the computed dwindle insertion order when the compositor is in the configuration
+/// the model was measured in, saved reading order (with the reason) otherwise. Returns the
+/// pointer it computed for.
+fn insertion_order(host: &dyn Host, rects: &[dwindle::Rect]) -> (Vec<usize>, Option<String>, Option<(i32, i32)>) {
+    let reading = || dwindle::reading_order(rects);
+    let layout = host.option("general:layout");
+    if layout.as_deref() != Some("dwindle") {
+        return (reading(), Some(format!("layout is {}, not dwindle", layout.as_deref().unwrap_or("unknown"))), None);
+    }
+    let split = host.option("dwindle:force_split");
+    if split.as_deref() != Some("2") {
+        return (
+            reading(),
+            Some(format!("dwindle:force_split is {}, not 2", split.as_deref().unwrap_or("unknown"))),
+            None,
+        );
+    }
+    let Some(pointer) = host.cursor_pos() else {
+        return (reading(), Some("the pointer position is unknown".to_string()), None);
+    };
+    let gaps_out = option_number(host, "general:gaps_out", dwindle::DEFAULT_GAPS_OUT);
+    match dwindle::computed_order(rects, (pointer.0 as f64, pointer.1 as f64), gaps_out, dwindle::CUT_TOLERANCE) {
+        Ok(order) => (order, None, Some(pointer)),
+        Err(reason) => (reading(), Some(reason), Some(pointer)),
+    }
+}
+
+/// Place a workspace's held windows together, in insertion order, against fresh live state
+fn flush_workspace(host: &dyn Host, st: &mut LoadState, key: &WsKey) {
+    let mut held = st.queue.take(key);
+    if held.is_empty() {
+        return;
+    }
+    // The order is computed over every tiled save of the workspace (the saved tree), so a
+    // missing window leaves a hole rather than reshaping the others' order
+    let tiled: Vec<usize> = st
+        .plan
+        .saved
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| crate::queue::is_queued(c) && ws_key(c) == *key)
+        .map(|(i, _)| i)
+        .collect();
+    let rects: Vec<dwindle::Rect> = tiled
+        .iter()
+        .map(|&i| {
+            let c = &st.plan.saved[i];
+            (c.at.0 as f64, c.at.1 as f64, (c.at.0 + c.size.0) as f64, (c.at.1 + c.size.1) as f64)
+        })
+        .collect();
+    let (order, fallback, pointer) = insertion_order(host, &rects);
+    let rank: HashMap<usize, usize> = order.iter().enumerate().map(|(r, &pos)| (tiled[pos], r)).collect();
+    held.sort_by_key(|h| (rank.get(&h.saved_index).copied().unwrap_or(usize::MAX), h.saved_index));
+
+    match &fallback {
+        None => println!("Workspace {}: placing {} tiled windows in computed insertion order", key.0, held.len()),
+        Some(reason) => {
+            println!("Workspace {}: placing {} tiled windows in saved reading order ({reason})", key.0, held.len())
+        }
+    }
+    let live = host.clients().unwrap_or_default();
+    let count = held.len();
+    for Held { saved_index, saved, live: address } in held {
+        match live.iter().find(|c| c.address == address) {
+            Some(window) => {
+                apply(host, window, &saved);
+                st.report.placed += 1;
+            }
+            None => {
+                println!("Warning: '{}' vanished before it was placed", saved.title);
+                st.placer.release(saved_index);
+            }
+        }
+    }
+    let pointer_moved = match (pointer, host.cursor_pos()) {
+        (Some(before), Some(after)) => before != after,
+        _ => false,
+    };
+    if pointer_moved {
+        println!("Warning: the pointer moved while workspace {} was placed; its order may not have been reproduced", key.0);
+    }
+    st.report.flushes.push(FlushReport { workspace: key.0, windows: count, fallback, pointer_moved });
+}
+
+/// Flush every workspace whose queue is ready
+fn flush_ready(host: &dyn Host, st: &mut LoadState) {
+    for key in st.queue.ready() {
+        flush_workspace(host, st, &key);
+    }
+}
+
+fn flush_all(host: &dyn Host, st: &mut LoadState) {
+    for key in st.queue.all_held() {
+        flush_workspace(host, st, &key);
+    }
+}
+
 /// Place every live window that claims a saved client; returns the windows claimed now.
-/// Protected windows (other workspaces in a scoped load) are never claimed.
-fn place_live(
-    host: &dyn Host,
-    placer: &mut Placer,
-    live: &[Client],
-    protected: &HashSet<Address>,
-    report: &mut LoadReport,
-) -> Vec<Address> {
+/// Tiled claims are held and placed together once their workspace is ready.
+fn place_live(host: &dyn Host, st: &mut LoadState, live: &[Client]) -> Vec<Address> {
     let mut claimed = vec![];
-    for window in live.iter().filter(|c| c.mapped && !protected.contains(&c.address)) {
-        if let Some(wanted) = placer.assign(window) {
-            apply(host, window, &wanted);
-            report.placed += 1;
+    for window in live.iter().filter(|c| c.mapped && !st.protected.contains(&c.address)) {
+        if let Some((saved_index, wanted)) = st.placer.assign_indexed(window) {
+            if st.queue.holds(&wanted) {
+                st.queue.hold(Held { saved_index, saved: wanted, live: window.address.clone() });
+            } else {
+                apply(host, window, &wanted);
+                st.report.placed += 1;
+            }
             claimed.push(window.address.clone());
         }
     }
+    flush_ready(host, st);
     claimed
 }
 
@@ -745,22 +902,17 @@ fn place_live(
 /// placing windows as they arrive; `claimed` counts the group's own new windows
 fn settle_group(
     host: &dyn Host,
-    placer: &mut Placer,
+    st: &mut LoadState,
     before: &HashSet<Address>,
-    protected: &HashSet<Address>,
     expected: usize,
     claimed: &mut usize,
-    report: &mut LoadReport,
 ) {
     let mut stable = 0;
     while *claimed < expected && stable < SETTLE_TICKS {
         host.pause();
         stable += 1;
         let Ok(live) = host.clients() else { continue };
-        let new = place_live(host, placer, &live, protected, report)
-            .into_iter()
-            .filter(|a| !before.contains(a))
-            .count();
+        let new = place_live(host, st, &live).into_iter().filter(|a| !before.contains(a)).count();
         if new > 0 {
             *claimed += new;
             stable = 0;
@@ -774,16 +926,14 @@ fn settle_group(
 /// group that produced nothing is a failed launch and is only reported, never re-invoked.
 fn fulfil_group(
     host: &dyn Host,
-    placer: &mut Placer,
+    st: &mut LoadState,
     entry: &ExecEntry,
     group: &GroupInfo,
     before: &HashSet<Address>,
-    protected: &HashSet<Address>,
     mut claimed: usize,
-    report: &mut LoadReport,
 ) {
     let expected = group.saved.len();
-    settle_group(host, placer, before, protected, expected, &mut claimed, report);
+    settle_group(host, st, before, expected, &mut claimed);
     let mut reinvocations = 0;
     if claimed > 0 {
         let bound = expected.saturating_sub(claimed);
@@ -793,7 +943,7 @@ fn fulfil_group(
             if host.send(&Op::Exec(entry.command.clone())).is_err() {
                 break;
             }
-            settle_group(host, placer, before, protected, expected, &mut claimed, report);
+            settle_group(host, st, before, expected, &mut claimed);
         }
     }
     if claimed < expected {
@@ -801,7 +951,7 @@ fn fulfil_group(
             "Warning: '{}' produced {claimed} of {expected} saved windows after {reinvocations} extra launches",
             group.label
         );
-        report.shortfalls.push(GroupShortfall {
+        st.report.shortfalls.push(GroupShortfall {
             label: group.label.clone(),
             expected,
             got: claimed,
@@ -810,19 +960,23 @@ fn fulfil_group(
     }
 }
 
-/// Run a load: launch each entry in order waiting for its window, placing windows as
-/// they appear, then keep placing until everything saved is matched or time runs out
+/// Run a load: launch each entry in order waiting for its window, claiming windows as
+/// they appear, then keep claiming until everything saved is matched or time runs out.
+/// Tiled windows are placed per workspace (see `PlacementQueue`); floating ones on claim.
 pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
-    let mut placer = Placer::new(if plan.place_by_class { plan.saved.clone() } else { vec![] });
-    let mut report = LoadReport::default();
-    // In a scoped load, every window that is not on the loaded workspace is off limits:
-    // never claimed, moved, or reported
     let protected: HashSet<Address> = match plan.scope {
         Some(workspace) => host
             .clients()
             .map(|c| c.into_iter().filter(|c| c.workspace.id != workspace).map(|c| c.address).collect())
             .unwrap_or_default(),
         None => HashSet::new(),
+    };
+    let mut st = LoadState {
+        plan,
+        placer: Placer::new(if plan.place_by_class { plan.saved.clone() } else { vec![] }),
+        queue: if plan.place_by_class { PlacementQueue::new(&plan.saved, &plan.entries) } else { PlacementQueue::disabled() },
+        protected,
+        report: LoadReport::default(),
     };
 
     for entry in &plan.entries {
@@ -832,6 +986,8 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
             .unwrap_or_default();
         if let Err(e) = host.send(&Op::Exec(entry.command.clone())) {
             println!("Warning: failed to launch '{}': {e}", entry.command);
+            st.queue.entry_done(&plan.saved, entry);
+            flush_ready(host, &mut st);
             continue;
         }
         let mut claimed = 0;
@@ -839,43 +995,44 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
             host.pause();
             let Ok(live) = host.clients() else { continue };
             if plan.place_by_class {
-                claimed += place_live(host, &mut placer, &live, &protected, &mut report)
-                    .into_iter()
-                    .filter(|a| !before.contains(a))
-                    .count();
+                claimed += place_live(host, &mut st, &live).into_iter().filter(|a| !before.contains(a)).count();
             }
             let new_window = live.iter().find(|c| c.mapped && !before.contains(&c.address));
             if let Some(window) = new_window {
                 if !plan.place_by_class {
                     apply(host, window, &desired_from_rules(window, &entry.rules));
-                    report.placed += 1;
+                    st.report.placed += 1;
                 }
                 break;
             }
         }
         if let (true, Some(group)) = (plan.place_by_class, entry.group.as_ref()) {
-            fulfil_group(host, &mut placer, entry, group, &before, &protected, claimed, &mut report);
+            fulfil_group(host, &mut st, entry, group, &before, claimed);
         }
+        st.queue.entry_done(&plan.saved, entry);
+        flush_ready(host, &mut st);
     }
 
     if plan.place_by_class {
         let mut ticks = 0;
-        while !placer.is_complete() && ticks < plan.tail_ticks {
+        while !st.placer.is_complete() && ticks < plan.tail_ticks {
             host.pause();
             ticks += 1;
             if let Ok(live) = host.clients() {
-                place_live(host, &mut placer, &live, &protected, &mut report);
+                place_live(host, &mut st, &live);
             }
         }
-        report.unmatched = placer.unmatched().into_iter().cloned().collect();
-        for client in &report.unmatched {
+        // Nothing claimed may stay held, whatever the workspace's launches did
+        flush_all(host, &mut st);
+        st.report.unmatched = st.placer.unmatched().into_iter().cloned().collect();
+        for client in &st.report.unmatched {
             println!("Warning: no window appeared for saved client '{}' ({})", client.title, client.class);
         }
         if let Ok(live) = host.clients() {
-            let claimed = placer.claimed_addresses();
-            report.surplus = live
+            let claimed = st.placer.claimed_addresses();
+            st.report.surplus = live
                 .into_iter()
-                .filter(|c| c.mapped && !claimed.contains(&c.address) && !protected.contains(&c.address))
+                .filter(|c| c.mapped && !claimed.contains(&c.address) && !st.protected.contains(&c.address))
                 .collect();
         }
     }
@@ -883,7 +1040,7 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
     if let Some(workspace) = plan.restore_workspace {
         let _ = host.send(&Op::FocusWorkspace(workspace));
     }
-    report
+    st.report
 }
 
 #[cfg(test)]
@@ -1180,6 +1337,12 @@ mod tests {
         signals: RefCell<Vec<(i32, Signal)>>,
         /// pid -> how much it takes to remove its windows: 0 close, 1 SIGTERM, 2 SIGKILL, 3 never
         resist: RefCell<std::collections::HashMap<i32, u8>>,
+        options: RefCell<std::collections::HashMap<String, String>>,
+        cursor: Cell<Option<(i32, i32)>>,
+        /// Where the pointer jumps to when the first window is moved to a workspace
+        drift_to: Cell<Option<(i32, i32)>>,
+        /// (number of Execs sent, address): the window disappears once that many launches happened
+        hide: RefCell<Option<(usize, String)>>,
     }
 
     impl FakeHost {
@@ -1192,13 +1355,34 @@ mod tests {
                 pauses: Cell::new(0),
                 signals: RefCell::new(vec![]),
                 resist: RefCell::new(Default::default()),
+                options: RefCell::new(Default::default()),
+                cursor: Cell::new(None),
+                drift_to: Cell::new(None),
+                hide: RefCell::new(None),
             }
+        }
+
+        /// A compositor in the configuration the computed order is defined for, pointer bottom-left
+        fn dwindle(self) -> Self {
+            self.options.borrow_mut().insert("general:layout".into(), "dwindle".into());
+            self.options.borrow_mut().insert("dwindle:force_split".into(), "2".into());
+            self.cursor.set(Some((300, 900)));
+            self
         }
     }
 
     impl Host for FakeHost {
         fn clients(&self) -> hyprland::Result<Vec<Client>> {
-            Ok(self.windows.borrow().iter().filter(|(due, _)| *due <= self.tick.get()).map(|(_, c)| c.clone()).collect())
+            let hidden = self.hide.borrow().as_ref().filter(|(n, _)| {
+                self.sent.borrow().iter().filter(|o| matches!(o, Op::Exec(_))).count() >= *n
+            }).map(|(_, a)| a.clone());
+            Ok(self
+                .windows
+                .borrow()
+                .iter()
+                .filter(|(due, c)| *due <= self.tick.get() && hidden.as_deref() != Some(c.address.to_string().as_str()))
+                .map(|(_, c)| c.clone())
+                .collect())
         }
         fn send(&self, op: &Op) -> hyprland::Result<()> {
             if let Op::Exec(_) = op {
@@ -1212,9 +1396,14 @@ mod tests {
                     !(c.address == *addr && resist.get(&c.pid).copied().unwrap_or(0) == 0)
                 });
             }
+            if let (Op::MoveToWorkspace { .. }, Some(to)) = (op, self.drift_to.get()) {
+                self.cursor.set(Some(to));
+            }
             self.sent.borrow_mut().push(op.clone());
             Ok(())
         }
+        fn cursor_pos(&self) -> Option<(i32, i32)> { self.cursor.get() }
+        fn option(&self, key: &str) -> Option<String> { self.options.borrow().get(key).cloned() }
         fn signal(&self, pid: i32, signal: Signal) {
             self.signals.borrow_mut().push((pid, signal));
             let needed = match signal { Signal::Term => 1, Signal::Kill => 2 };
@@ -1680,5 +1869,262 @@ mod tests {
         assert_eq!(focuses, vec![&Op::FocusWorkspace(2)]);
         // And it is not reported as surplus either
         assert!(report.surplus.is_empty());
+    }
+
+    #[test]
+    fn test_placer_reports_the_claimed_index_and_gives_claims_back() {
+        let saves = vec![client("kitty", "a", 1, false, (0, 0), (1, 1)), client("kitty", "b", 1, false, (0, 0), (1, 1))];
+        let mut placer = Placer::new(saves);
+        let live = client("kitty", "b", 9, false, (1, 0), (1, 1));
+        let (index, claimed) = placer.assign_indexed(&live).unwrap();
+        assert_eq!((index, claimed.title.as_str()), (1, "b"));
+        assert!(placer.assign_indexed(&live).is_none(), "one live window claims once");
+        placer.release(index);
+        assert_eq!(placer.unmatched().len(), 2);
+        assert_eq!(placer.assign_indexed(&live).unwrap().0, 1);
+    }
+
+    // ---- placement queue: tiled windows are placed per workspace, in computed insertion order
+
+    /// One tiled save per class on `ws`, at the given rectangles (x, y, w, h)
+    fn tiled_saves(ws: i32, shape: &[(i16, i16, i16, i16)]) -> Vec<Client> {
+        shape
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, y, w, h))| client(&format!("app{i}"), "t", ws, false, (x, y), (w, h)))
+            .collect()
+    }
+
+    /// Spike #1 fixture "A" (insertion order = index order at a bottom-left pointer) and a
+    /// reading order that differs from it: index 1 is the full-height window on the right
+    const S4: [(i16, i16, i16, i16); 4] = [(12, 38, 941, 508), (967, 38, 941, 1030), (12, 560, 466, 508), (492, 560, 461, 508)];
+
+    fn live_window(class: &str, n: i16) -> Client {
+        let mut c = client(class, "t", 9, false, (50 + n, 0), (1, 1));
+        c.address = hyprland::shared::Address::new(format!("0xa{n:02x}"));
+        c
+    }
+
+    /// Entries launching `launch_order` (indices into the saves), each bringing up its own window
+    fn launching(saves: &[Client], launch_order: &[usize]) -> (Vec<ExecEntry>, Vec<Vec<(u64, Client)>>) {
+        let entries = launch_order.iter().map(|&i| group_entry(&format!("app{i}"), vec![i])).collect();
+        let scripts = launch_order.iter().map(|&i| vec![(1, live_window(&saves[i].class, i as i16))]).collect();
+        (entries, scripts)
+    }
+
+    /// The addresses of the windows moved to a workspace, in the order the moves were sent
+    fn moved(host: &FakeHost) -> Vec<String> {
+        host.sent
+            .borrow()
+            .iter()
+            .filter_map(|o| match o {
+                Op::MoveToWorkspace { window, .. } => Some(window.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn plan_for(entries: Vec<ExecEntry>, saved: Vec<Client>) -> LoadPlan {
+        LoadPlan { entries, saved, place_by_class: true, tail_ticks: 0, scope: None, restore_workspace: None }
+    }
+
+    #[test]
+    fn test_tiled_moves_follow_the_computed_order_whatever_the_arrival_order() {
+        let saves = tiled_saves(2, &S4);
+        let expected: Vec<String> = (0..4).map(|i| format!("0xa{i:02x}")).collect();
+        for arrival in [[0, 1, 2, 3], [3, 2, 1, 0], [2, 0, 3, 1]] {
+            let (entries, scripts) = launching(&saves, &arrival);
+            let host = FakeHost::new(vec![], scripts).dwindle();
+            let report = run_load(&host, &plan_for(entries, saves.clone()));
+            assert_eq!(moved(&host), expected, "arrival {arrival:?}");
+            assert_eq!(report.placed, 4);
+            assert_eq!(report.flushes, vec![FlushReport { workspace: 2, windows: 4, fallback: None, pointer_moved: false }]);
+        }
+    }
+
+    #[test]
+    fn test_unreachable_tree_falls_back_to_reading_order_and_says_why() {
+        // the same fixture with the pointer on the right: not the tree dwindle grows there
+        let saves = tiled_saves(2, &S4);
+        let (entries, scripts) = launching(&saves, &[0, 1, 2, 3]);
+        let host = FakeHost::new(vec![], scripts).dwindle();
+        host.cursor.set(Some((1500, 200)));
+        let report = run_load(&host, &plan_for(entries, saves));
+        // reading order: x, then y -> indices 0, 2, 3, 1
+        assert_eq!(moved(&host), vec!["0xa00", "0xa02", "0xa03", "0xa01"]);
+        assert!(report.flushes[0].fallback.as_deref().unwrap().contains("not one dwindle grows"));
+    }
+
+    #[test]
+    fn test_other_layouts_and_unreadable_options_fall_back_to_reading_order() {
+        let saves = tiled_saves(2, &S4);
+        for (key, value) in [("general:layout", "master"), ("dwindle:force_split", "0")] {
+            let (entries, scripts) = launching(&saves, &[0, 1, 2, 3]);
+            let host = FakeHost::new(vec![], scripts).dwindle();
+            host.options.borrow_mut().insert(key.into(), value.into());
+            let report = run_load(&host, &plan_for(entries, saves.clone()));
+            assert_eq!(moved(&host), vec!["0xa00", "0xa02", "0xa03", "0xa01"], "{key}={value}");
+            assert!(report.flushes[0].fallback.is_some());
+        }
+        // a host that can tell nothing (no options, no pointer)
+        let (entries, scripts) = launching(&saves, &[0, 1, 2, 3]);
+        let host = FakeHost::new(vec![], scripts);
+        let report = run_load(&host, &plan_for(entries, saves));
+        assert!(report.flushes[0].fallback.as_deref().unwrap().contains("unknown"));
+        assert_eq!(report.placed, 4);
+    }
+
+    #[test]
+    fn test_nothing_is_moved_until_the_workspace_is_ready() {
+        // Two apps for ws 2, then one for ws 3: ws 2's moves come after its second Exec and
+        // before ws 3's launch
+        let mut saves = tiled_saves(2, &S4[..2]);
+        saves.push(client("app2", "t", 3, false, (12, 38), (1896, 1030)));
+        let (entries, scripts) = launching(&saves, &[0, 1, 2]);
+        let host = FakeHost::new(vec![], scripts).dwindle();
+        run_load(&host, &plan_for(entries, saves));
+        let sent = host.sent.borrow();
+        let pos = |f: &dyn Fn(&Op) -> bool| sent.iter().position(|o| f(o)).unwrap();
+        let first_move = pos(&|o| matches!(o, Op::MoveToWorkspace { .. }));
+        let exec = |n: usize| sent.iter().enumerate().filter(|(_, o)| matches!(o, Op::Exec(_))).nth(n).unwrap().0;
+        assert!(exec(0) < exec(1) && exec(1) < first_move, "{sent:?}");
+        assert!(first_move < exec(2), "ws 2 flushes before ws 3 launches: {sent:?}");
+    }
+
+    #[test]
+    fn test_workspace_flushes_at_the_end_of_the_phase_when_a_window_never_comes() {
+        // Expected 3 on ws 2; the third app produces nothing
+        let saves = tiled_saves(2, &S4[..3]);
+        let (entries, mut scripts) = launching(&saves, &[0, 1, 2]);
+        scripts[2] = vec![];
+        let host = FakeHost::new(vec![], scripts).dwindle();
+        let report = run_load(&host, &plan_for(entries, saves));
+        assert_eq!(moved(&host), vec!["0xa00", "0xa01"]);
+        assert_eq!(report.placed, 2);
+        assert_eq!(report.unmatched.len(), 1);
+    }
+
+    #[test]
+    fn test_window_arriving_after_the_flush_is_placed_on_claim() {
+        // app1 maps after the 20 s launch wait and the settle: it is a late arrival
+        let saves = tiled_saves(2, &S4[..2]);
+        let (entries, mut scripts) = launching(&saves, &[0, 1]);
+        scripts[1] = vec![(LAUNCH_WAIT_TICKS + SETTLE_TICKS + 5, live_window("app1", 1))];
+        let host = FakeHost::new(vec![], scripts).dwindle();
+        let mut plan = plan_for(entries, saves);
+        plan.tail_ticks = 2 * LAUNCH_WAIT_TICKS;
+        let report = run_load(&host, &plan);
+        assert_eq!(moved(&host), vec!["0xa00", "0xa01"]);
+        assert_eq!(report.placed, 2);
+        assert!(report.unmatched.is_empty());
+        // two flushes never happen for one workspace: the late window was placed on claim
+        assert_eq!(report.flushes.len(), 1);
+    }
+
+    #[test]
+    fn test_floating_windows_are_placed_on_claim_with_exact_geometry() {
+        let mut saves = tiled_saves(2, &S4[..2]);
+        saves.push(client("app2", "t", 2, true, (100, 200), (300, 400)));
+        let (entries, scripts) = launching(&saves, &[0, 2, 1]);
+        let host = FakeHost::new(vec![], scripts).dwindle();
+        run_load(&host, &plan_for(entries, saves));
+        let sent = host.sent.borrow();
+        let float_move = sent.iter().position(|o| matches!(o, Op::MoveWindow { x: 100, y: 200, .. })).unwrap();
+        let second_exec = sent.iter().enumerate().filter(|(_, o)| matches!(o, Op::Exec(_))).nth(2).unwrap().0;
+        assert!(float_move < second_exec, "the float is placed before the next launch: {sent:?}");
+        assert!(sent.iter().any(|o| matches!(o, Op::ResizeWindow { w: 300, h: 400, .. })));
+        // tiled windows are never given geometry
+        assert_eq!(sent.iter().filter(|o| matches!(o, Op::MoveWindow { .. })).count(), 1);
+    }
+
+    #[test]
+    fn test_group_reinvocation_newcomers_join_the_same_ordered_flush() {
+        // One app opens two windows, but the first launch brings up only one
+        let saves = tiled_saves(2, &S4[..2]).into_iter().map(|mut c| { c.class = "app".into(); c.title = "t".into(); c }).collect::<Vec<_>>();
+        let mk = |n: i16| { let mut c = live_window("app", n); c.title = "t".into(); c };
+        let host = FakeHost::new(vec![], vec![vec![(1, mk(0))], vec![(1, mk(1))]]).dwindle();
+        let plan = plan_for(vec![group_entry("app", vec![0, 1])], saves);
+        let report = run_load(&host, &plan);
+        assert_eq!(execs(&host).len(), 2);
+        assert_eq!(report.placed, 2);
+        assert_eq!(report.flushes.len(), 1);
+        assert_eq!(report.flushes[0].windows, 2);
+    }
+
+    #[test]
+    fn test_adjust_only_moves_existing_windows_in_the_computed_order() {
+        let saves = tiled_saves(2, &S4);
+        let live: Vec<Client> = (0..4).rev().map(|i| live_window(&saves[i].class, i as i16)).collect();
+        let host = FakeHost::new(live, vec![]).dwindle();
+        let mut plan = plan_for(vec![], saves);
+        plan.tail_ticks = 3;
+        run_load(&host, &plan);
+        assert_eq!(moved(&host), vec!["0xa00", "0xa01", "0xa02", "0xa03"]);
+    }
+
+    #[test]
+    fn test_scoped_load_queues_within_its_slice_only() {
+        let other = win("brave", 11, 5, 1);
+        let saves = tiled_saves(2, &S4[..3]);
+        let (entries, scripts) = launching(&saves, &[2, 1, 0]);
+        let host = FakeHost::new(vec![other.clone()], scripts).dwindle();
+        let mut plan = plan_for(entries, saves);
+        plan.scope = Some(2);
+        let report = run_load(&host, &plan);
+        assert_eq!(moved(&host), vec!["0xa00", "0xa01", "0xa02"]);
+        assert!(!host.sent.borrow().iter().any(|o| format!("{o:?}").contains(&other.address.to_string())));
+        assert!(report.surplus.is_empty());
+    }
+
+    #[test]
+    fn test_vanished_held_window_is_released_and_its_replacement_is_placed() {
+        // app1's window is claimed and held; it is gone by the time ws 2 is complete (app2's
+        // arrival). The app opens a replacement afterwards, which the tail claims and places.
+        let saves = tiled_saves(2, &S4[..3]);
+        let (entries, mut scripts) = launching(&saves, &[0, 1, 2]);
+        scripts[2].push((4, live_window("app1", 7)));
+        let host = FakeHost::new(vec![], scripts).dwindle();
+        *host.hide.borrow_mut() = Some((3, "0xa01".to_string()));
+        let mut plan = plan_for(entries, saves);
+        plan.tail_ticks = 10;
+        let report = run_load(&host, &plan);
+        // the vanished window gets no op; the other two are placed in order, the replacement on claim
+        assert_eq!(moved(&host), vec!["0xa00", "0xa02", "0xa07"]);
+        assert_eq!(report.placed, 3);
+        assert!(report.unmatched.is_empty());
+    }
+
+    #[test]
+    fn test_pointer_moving_during_a_flush_is_reported() {
+        let saves = tiled_saves(2, &S4);
+        let (entries, scripts) = launching(&saves, &[0, 1, 2, 3]);
+        let host = FakeHost::new(vec![], scripts).dwindle();
+        host.drift_to.set(Some((1500, 200)));
+        let report = run_load(&host, &plan_for(entries, saves));
+        assert!(report.flushes[0].pointer_moved);
+    }
+
+    #[test]
+    fn test_anonymous_special_and_legacy_loads_bypass_the_queue() {
+        // anonymous special: placed on claim (and skipped by plan_adjustment)
+        let saves = vec![client("app0", "t", -99, false, (12, 38), (1896, 1030))];
+        let (entries, scripts) = launching(&saves, &[0]);
+        let host = FakeHost::new(vec![], scripts).dwindle();
+        let report = run_load(&host, &plan_for(entries, saves));
+        assert_eq!(report.placed, 1);
+        assert!(report.flushes.is_empty());
+    }
+
+    #[test]
+    fn test_nothing_claimed_stays_held_when_the_load_ends() {
+        // a group-less entry is pending everywhere until it ends; the tail still flushes
+        let saves = tiled_saves(2, &S4[..2]);
+        let host = FakeHost::new(vec![], vec![vec![(1, live_window("app0", 0)), (2, live_window("app1", 1))]]).dwindle();
+        let entry = ExecEntry { rules: ExecRules::default(), command: "x".into(), group: None };
+        let mut plan = plan_for(vec![entry], saves);
+        plan.tail_ticks = 5;
+        let report = run_load(&host, &plan);
+        assert_eq!(report.placed, 2);
+        assert_eq!(moved(&host).len(), 2);
     }
 }

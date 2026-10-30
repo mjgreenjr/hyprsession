@@ -164,8 +164,21 @@ repeated (at most once per missing window); a shortfall that remains is reported
 unmatched, and the load still completes. After placement, live windows that no saved window claimed are listed
 (address, class, title, workspace); they are never touched.
 
+## Tiled window order
+Dwindle builds its tree from the order windows are inserted, so placing each window as it maps would let app
+start-up latency decide who sits where. A load therefore claims tiled windows as they appear but places each
+workspace's tiled windows together, once every saved tiled window of that workspace is claimed or its launches are
+over, in the order that makes dwindle regrow the saved tree (computed from the saved rectangles and the current
+mouse pointer position; the pointer is read, never moved). Floating windows are placed exactly as before. When the
+computed order is not available (layout other than dwindle, `dwindle:force_split` other than 2, a saved tree dwindle
+would not grow with the pointer where it is, a pointer exactly on a boundary) the workspace falls back to the saved
+reading order and the load says why; that fallback can rotate same-class windows between reloads. Windows destined
+for the workspace that is visible when the load starts are not moved and keep their arrival position. Dividers
+that were dragged away from 50/50 are not restored.
+
 ## Change log
 ### Unreleased
+* Place tiled windows per workspace in the computed dwindle insertion order (reading order as the fallback)
 * Launch windows from their saved working directory
 * Restore the program running in the foreground of a terminal (resume table, `resume.toml`)
 * Launch again when a program produced fewer windows than were saved

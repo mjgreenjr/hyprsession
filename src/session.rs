@@ -401,6 +401,7 @@ fn simulate_load(dispatcher: &Dispatcher, plan: &LoadPlan) {
     }
     if plan.place_by_class {
         println!("After placement, windows matched by no saved client will be listed (not touched)");
+        print_placement_order(&plan.saved);
         for wanted in &plan.saved {
             for op in plan_adjustment(&placeholder_client(), wanted) {
                 println!("Would send once the window exists: dispatch {}", dispatcher.render(&op));
@@ -412,6 +413,58 @@ fn simulate_load(dispatcher: &Dispatcher, plan: &LoadPlan) {
             for op in plan_adjustment(&blank, &desired_from_rules(&blank, &entry.rules)) {
                 println!("Would send once the window exists: dispatch {}", dispatcher.render(&op));
             }
+        }
+    }
+}
+
+/// Say how each workspace's tiled windows will be placed. The computed insertion order depends
+/// on the live compositor (layout options and the pointer), so a simulation can only promise the
+/// fallback: saved reading order.
+fn print_placement_order(saved: &[Client]) {
+    let mut workspaces: Vec<(i32, String)> = vec![];
+    for client in saved.iter().filter(|c| crate::queue::is_queued(c)) {
+        let key = crate::queue::ws_key(client);
+        if !workspaces.contains(&key) {
+            workspaces.push(key);
+        }
+    }
+    workspaces.sort();
+    for key in workspaces {
+        let rects: Vec<crate::dwindle::Rect> = saved
+            .iter()
+            .filter(|c| crate::queue::is_queued(c) && crate::queue::ws_key(c) == key)
+            .map(|c| (c.at.0 as f64, c.at.1 as f64, (c.at.0 + c.size.0) as f64, (c.at.1 + c.size.1) as f64))
+            .collect();
+        let titles: Vec<&str> = saved
+            .iter()
+            .filter(|c| crate::queue::is_queued(c) && crate::queue::ws_key(c) == key)
+            .map(|c| c.title.as_str())
+            .collect();
+        let reading: Vec<String> =
+            crate::dwindle::reading_order(&rects).into_iter().map(|i| format!("'{}'", titles[i])).collect();
+        println!(
+            "Workspace {}: its {} tiled windows are placed together once claimed, in the computed dwindle \
+             insertion order (decided at load time from the pointer; saved reading order if the tree is \
+             unreachable): reading order would be {}",
+            key.0,
+            rects.len(),
+            reading.join(", ")
+        );
+    }
+}
+
+/// Report how each workspace's tiled windows were ordered, and why any fell back to reading order
+fn print_flushes(flushes: &[crate::load::FlushReport]) {
+    for flush in flushes {
+        match &flush.fallback {
+            None => println!("Workspace {}: {} tiled windows placed in computed insertion order", flush.workspace, flush.windows),
+            Some(reason) => println!(
+                "Workspace {}: {} tiled windows placed in saved reading order ({reason}); the layout may not reproduce",
+                flush.workspace, flush.windows
+            ),
+        }
+        if flush.pointer_moved {
+            println!("  the pointer moved during placement; the order may not have been reproduced");
         }
     }
 }
@@ -527,6 +580,7 @@ impl Session for LocalSession {
             let host = RealHost { dispatcher };
             let report = run_load(&host, &plan);
             println!("Placed {} windows, {} saved windows not matched", report.placed, report.unmatched.len());
+            print_flushes(&report.flushes);
             print_shortfalls(&report.shortfalls, &report.unmatched);
             print_surplus(&report.surplus);
         }
