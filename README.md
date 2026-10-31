@@ -165,20 +165,32 @@ unmatched, and the load still completes. After placement, live windows that no s
 (address, class, title, workspace); they are never touched.
 
 ## Tiled window order
-Dwindle builds its tree from the order windows are inserted, so placing each window as it maps would let app
-start-up latency decide who sits where. A load therefore claims tiled windows as they appear but places each
-workspace's tiled windows together, once every saved tiled window of that workspace is claimed or its launches are
-over, in the order that makes dwindle regrow the saved tree (computed from the saved rectangles and the current
-mouse pointer position; the pointer is read, never moved). Floating windows are placed exactly as before. When the
-computed order is not available (layout other than dwindle, `dwindle:force_split` other than 2, a saved tree dwindle
-would not grow with the pointer where it is, a pointer exactly on a boundary) the workspace falls back to the saved
-reading order and the load says why; that fallback can rotate same-class windows between reloads. Windows destined
-for the workspace that is visible when the load starts are not moved and keep their arrival position. Dividers
-that were dragged away from 50/50 are not restored.
+Dwindle builds its tree from the order windows are inserted, and each new window splits the leaf nearest the mouse
+pointer. Placing each window as it maps would let app start-up latency and the pointer decide who sits where. A load
+therefore claims tiled windows as they appear but places each workspace's tiled windows together, once every saved
+tiled window of that workspace is claimed or its launches are over. For each workspace the loader rebuilds the saved
+tree from the saved rectangles and inserts the windows in the order that regrows it, moving the mouse pointer into the
+leaf to split before each insertion (a load already closes every window, so steering the pointer for its duration is
+minor); the saved tree is reproduced whatever the pointer was, and the pointer is put back where it was when the load
+finishes. Afterwards the loader reads the geometry back and says how many windows are at their saved geometry.
+Floating windows are placed exactly as before.
+
+If the compositor does not accept a pointer warp (checked by reading the pointer back), the order is computed for the
+pointer as found; when that cannot regrow the tree (layout other than dwindle, `dwindle:force_split` other than 2, a
+pointer exactly on a boundary) the workspace falls back to the saved reading order and the load says why. A tree that
+fallback produces is still one the next load reproduces exactly. Windows destined for the workspace that is visible
+when the load starts are not moved and keep their arrival position. Dragged (non-50/50) dividers are not restored.
+
+## Loading survives its terminal
+`hyprsession load` closes every window, including the terminal it was typed in. It therefore re-runs itself in its own
+session (no controlling terminal, SIGHUP ignored), writing to `load.log` in the session directory, and the command you
+typed just follows that log and returns the load's exit status: closing the terminal mid-load ends only the follower.
+Set `HYPRSESSION_NO_DETACH=1` to run a load in the foreground.
 
 ## Change log
 ### Unreleased
-* Place tiled windows per workspace in the computed dwindle insertion order (reading order as the fallback)
+* Place tiled windows per workspace so the saved tree regrows exactly: steered insertion order, pointer restored afterwards (computed order, then reading order, as fallbacks)
+* A load detaches itself from its terminal and logs to `load.log`
 * Launch windows from their saved working directory
 * Restore the program running in the foreground of a terminal (resume table, `resume.toml`)
 * Launch again when a program produced fewer windows than were saved

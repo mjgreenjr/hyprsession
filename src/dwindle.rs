@@ -37,7 +37,7 @@ pub enum Tree {
 }
 
 /// Split a node box along its longer side
-fn split_box(b: Rect) -> (Orient, Rect, Rect) {
+pub(crate) fn split_box(b: Rect) -> (Orient, Rect, Rect) {
     let (x0, y0, x1, y1) = b;
     if (x1 - x0) > (y1 - y0) {
         let xm = (x0 + x1) / 2.0;
@@ -49,7 +49,7 @@ fn split_box(b: Rect) -> (Orient, Rect, Rect) {
 }
 
 /// Distance from a point to a box (0 inside)
-fn distance(p: (f64, f64), b: Rect) -> f64 {
+pub(crate) fn distance(p: (f64, f64), b: Rect) -> f64 {
     let dx = (b.0 - p.0).max(0.0).max(p.0 - b.2);
     let dy = (b.1 - p.1).max(0.0).max(p.1 - b.3);
     dx.hypot(dy)
@@ -115,11 +115,18 @@ fn freeze(nodes: &[Node], at: usize) -> Tree {
 /// Errors when the pointer is equally near two leaves: the compositor's tie-break is not
 /// known, so no order can be trusted.
 pub fn simulate(n: usize, pointer: (f64, f64), layout: Rect) -> Result<Tree, String> {
+    simulate_steered(n, &vec![pointer; n.saturating_sub(1)], layout)
+}
+
+/// `simulate` with the pointer somewhere else for every insertion: `pointers[k - 2]` is the
+/// pointer when window `k` (k >= 2) is inserted
+pub fn simulate_steered(n: usize, pointers: &[(f64, f64)], layout: Rect) -> Result<Tree, String> {
     let mut nodes = vec![Node::Leaf(1)];
     let mut boxes: HashMap<usize, Rect> = HashMap::new(); // node index -> box, leaves only
     boxes.insert(0, layout);
     let mut leaf_node: Vec<usize> = vec![0]; // insertion index - 1 -> node index
     for k in 2..=n {
+        let pointer = pointers[k - 2];
         let mut ranked: Vec<(f64, usize)> =
             leaf_node.iter().enumerate().map(|(i, &node)| (distance(pointer, boxes[&node]), i)).collect();
         ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
@@ -189,6 +196,47 @@ pub fn computed_order(rects: &[Rect], pointer: (f64, f64), gaps_out: f64, tol: f
     let mut order: Vec<usize> = (0..rects.len()).collect();
     order.sort_by_key(|key| mapping[key]);
     Ok(order)
+}
+
+/// One insertion of a steered growth
+#[derive(Clone, Debug, PartialEq)]
+pub struct SteerStep {
+    /// Index into the rectangles
+    pub window: usize,
+    /// Where the pointer must be when this window is inserted (`None` for the first window,
+    /// which splits nothing)
+    pub pointer: Option<(f64, f64)>,
+}
+
+/// The insertion order and per-insertion pointer positions that grow ANY dwindle tree.
+/// Walk the saved tree breadth first; each internal node is the next split. Its box is, at
+/// that moment, a single leaf (its parent was split before it), so a pointer at the box's
+/// centre is strictly inside that leaf and nowhere near a boundary, and the pointer-nearest
+/// rule splits exactly it; the new window is the node's second child. Independent of where
+/// the user's pointer was.
+pub fn steer_schedule(rects: &[Rect], gaps_out: f64, tol: f64) -> Result<Vec<SteerStep>, String> {
+    if rects.is_empty() {
+        return Ok(vec![]);
+    }
+    let items: Vec<(usize, Rect)> = rects.iter().copied().enumerate().collect();
+    let tree = reconstruct(&items, tol).ok_or("the saved rectangles are not a dwindle partition")?;
+    fn occupant(t: &Tree) -> usize {
+        match t {
+            Tree::Leaf(i) => *i,
+            Tree::Split(_, a, _) => occupant(a),
+        }
+    }
+    let mut steps = vec![SteerStep { window: occupant(&tree), pointer: None }];
+    let mut queue = std::collections::VecDeque::from([(&tree, layout_box(rects, gaps_out))]);
+    while let Some((node, b)) = queue.pop_front() {
+        if let Tree::Split(_, a, c) = node {
+            let (_, first, second) = split_box(b);
+            steps.push(SteerStep { window: occupant(c), pointer: Some(((b.0 + b.2) / 2.0, (b.1 + b.3) / 2.0)) });
+            queue.push_back((a, first));
+            queue.push_back((c, second));
+        }
+    }
+    Ok(steps)
 }
 
 /// Saved reading order: x, then y, then position in the snapshot
@@ -389,5 +437,71 @@ mod tests {
     fn test_reading_order_is_x_then_y_then_position() {
         let rects = vec![(500.0, 0.0, 600.0, 10.0), (0.0, 500.0, 10.0, 600.0), (0.0, 0.0, 10.0, 10.0), (0.0, 0.0, 20.0, 20.0)];
         assert_eq!(reading_order(&rects), vec![2, 3, 1, 0]);
+    }
+
+    /// Leaf keys of a tree with each leaf mapped through `f`
+    fn relabel(t: &Tree, f: &dyn Fn(usize) -> usize) -> Tree {
+        match t {
+            Tree::Leaf(i) => Tree::Leaf(f(*i)),
+            Tree::Split(o, a, b) => Tree::Split(*o, Box::new(relabel(a, f)), Box::new(relabel(b, f))),
+        }
+    }
+
+    /// Does inserting in the schedule's order with its pointers regrow exactly the saved tree?
+    fn steered_regrows(rects: &[Rect]) -> bool {
+        let steps = steer_schedule(rects, 12.0, CUT_TOLERANCE).unwrap();
+        assert_eq!(steps.len(), rects.len());
+        assert_eq!(steps[0].pointer, None);
+        let pointers: Vec<(f64, f64)> = steps[1..].iter().map(|s| s.pointer.unwrap()).collect();
+        let grown = simulate_steered(rects.len(), &pointers, layout_box(rects, 12.0)).unwrap();
+        // insertion index k (1-based) is the window steps[k - 1].window
+        let by_insertion = relabel(&grown, &|k| steps[k - 1].window);
+        let saved = reconstruct(&rects.iter().copied().enumerate().collect::<Vec<_>>(), CUT_TOLERANCE).unwrap();
+        by_insertion == saved
+    }
+
+    // The WS9 trees of playtest round 2: the same three windows in the two shapes the loader flipped between
+    const WS9_B: [Rect; 3] = [(12.0, 38.0, 953.0, 546.0), (12.0, 560.0, 953.0, 1068.0), (967.0, 38.0, 1908.0, 1068.0)];
+    const WS9_C: [Rect; 3] = [(12.0, 38.0, 953.0, 1068.0), (967.0, 38.0, 1908.0, 546.0), (967.0, 560.0, 1908.0, 1068.0)];
+
+    #[test]
+    fn test_steering_reaches_trees_no_single_pointer_grows() {
+        for shape in [WS9_B, WS9_C] {
+            assert!(steered_regrows(&shape));
+        }
+        // WS9_C (full-height left) is unreachable at a bottom-left pointer: the unsteered path refuses it
+        assert!(computed_order(&WS9_C, BL, 12.0, CUT_TOLERANCE).is_err());
+        // the steered order is independent of the pointer: it has no pointer argument at all
+        assert_eq!(
+            steer_schedule(&WS9_C, 12.0, CUT_TOLERANCE).unwrap().iter().map(|s| s.window).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn test_steering_regrows_every_shape_a_pointer_can_grow_and_resized_dividers() {
+        for pointer in [TL, TR, BL, BR] {
+            for n in 1..=7 {
+                assert!(steered_regrows(&grown(n, pointer)), "n={n} pointer={pointer:?}");
+            }
+        }
+        // a divider dragged off 50/50 still has the same topology
+        let skewed = [(12.0, 38.0, 600.0, 1068.0), (614.0, 38.0, 1908.0, 400.0), (614.0, 414.0, 1908.0, 1068.0)];
+        assert!(steered_regrows(&skewed));
+    }
+
+    #[test]
+    fn test_steered_pointers_are_never_on_a_boundary() {
+        // every simulated insertion has a unique nearest leaf: simulate_steered would error on a tie
+        for shape in [&WS9_B[..], &WS9_C[..], &grown(6, TR)[..]] {
+            assert!(steered_regrows(shape));
+        }
+    }
+
+    #[test]
+    fn test_steer_schedule_of_non_partitions_is_refused() {
+        let overlap = [(12.0, 38.0, 1000.0, 1068.0), (900.0, 38.0, 1908.0, 1068.0)];
+        assert!(steer_schedule(&overlap, 12.0, CUT_TOLERANCE).is_err());
+        assert_eq!(steer_schedule(&[], 12.0, CUT_TOLERANCE), Ok(vec![]));
     }
 }

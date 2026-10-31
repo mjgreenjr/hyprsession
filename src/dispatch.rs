@@ -82,6 +82,10 @@ pub enum Op {
     FocusWindow(Address),
     MoveWorkspaceToMonitor { workspace: i32, monitor: i128 },
     Close(Address),
+    /// Warp the mouse pointer to layout coordinates. Dwindle splits the leaf nearest the
+    /// pointer, so the loader steers it while placing tiled windows. The Lua form is the
+    /// documented `hl.dsp.cursor.move`; callers verify the move by reading the pointer back.
+    MoveCursor { x: i32, y: i32 },
 }
 
 /// Quote a string as a single-quoted Lua string literal
@@ -145,6 +149,7 @@ pub fn render_lua(op: &Op) -> String {
             "hl.dsp.workspace.move({{ workspace = {workspace}, monitor = {monitor} }})"
         ),
         Op::Close(window) => format!("hl.dsp.window.close({{ window = {} }})", lua_window(window)),
+        Op::MoveCursor { x, y } => format!("hl.dsp.cursor.move({{ x = {x}, y = {y} }})"),
     }
 }
 
@@ -191,6 +196,7 @@ fn classic_call(op: &Op) -> hyprland::Result<()> {
         Op::Close(window) => {
             Dispatch::call(DispatchType::CloseWindow(ident(window)))
         }
+        Op::MoveCursor { x, y } => Dispatch::call(DispatchType::MoveCursor(*x as i64, *y as i64)),
     }
 }
 
@@ -437,5 +443,10 @@ mod tests {
                 "/dispatch hl.dsp.focus({ workspace = 1 })".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_move_cursor_renders_in_lua() {
+        assert_eq!(render_lua(&Op::MoveCursor { x: 480, y: 270 }), "hl.dsp.cursor.move({ x = 480, y = 270 })");
     }
 }

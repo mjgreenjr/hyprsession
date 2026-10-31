@@ -506,10 +506,15 @@ pub struct LoadReport {
 pub struct FlushReport {
     pub workspace: i32,
     pub windows: usize,
-    /// `None`: placed in the computed dwindle insertion order; `Some(reason)`: saved reading order
+    /// `None`: placed in a computed dwindle insertion order (steered, or for the pointer as
+    /// found); `Some(reason)`: saved reading order
     pub fallback: Option<String>,
-    /// The pointer was somewhere else when the flush ended: the order may not have been reproduced
+    /// The loader steered the pointer to each split target (independent of where the user's pointer was)
+    pub steered: bool,
+    /// The pointer was somewhere else than the loader left it: the order may not have been reproduced
     pub pointer_moved: bool,
+    /// (windows at their saved geometry, windows checked) read back from the compositor after the flush
+    pub verified: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -790,6 +795,11 @@ struct LoadState<'a> {
     queue: PlacementQueue,
     /// In a scoped load, every window outside the loaded workspace: never claimed, moved or reported
     protected: HashSet<Address>,
+    /// Where the user's pointer was when the load began (restored at the end if the loader moved it)
+    pointer_home: Option<(i32, i32)>,
+    pointer_moved_by_us: bool,
+    /// The compositor did not take a pointer warp: no more are attempted
+    steering_refused: bool,
     /// Saved windows that a resume launch (a terminal under the hyprsession wrapper) will bring up
     reserved: HashSet<usize>,
     report: LoadReport,
@@ -853,14 +863,37 @@ fn insertion_order(host: &dyn Host, rects: &[dwindle::Rect]) -> (Vec<usize>, Opt
     }
 }
 
-/// Place a workspace's held windows together, in insertion order, against fresh live state
+/// How close (px) the pointer must read back to count as warped
+const WARP_TOLERANCE: i32 = 3;
+/// How close (px) a window must be to its saved geometry to count as reproduced; gaps and
+/// rounding put saved and regrown rectangles a pixel or two apart
+const GEOMETRY_TOLERANCE: i32 = 6;
+
+/// Warp the pointer and read it back (the compositor applies dispatches in order, but the
+/// read-back is what proves the warp was accepted at all)
+fn warp_pointer(host: &dyn Host, x: i32, y: i32) -> bool {
+    for _ in 0..3 {
+        let _ = host.send(&Op::MoveCursor { x, y });
+        if host.cursor_pos().is_some_and(|(px, py)| (px - x).abs() <= WARP_TOLERANCE && (py - y).abs() <= WARP_TOLERANCE) {
+            return true;
+        }
+        host.pause();
+    }
+    false
+}
+
+/// Place a workspace's held windows together. Dwindle splits the leaf nearest the mouse
+/// pointer when a window arrives, so with a working pointer warp the loader drives the
+/// pointer into the leaf to split before each insertion and any saved tree regrows exactly,
+/// whatever the user's pointer was (the pointer is restored when the load ends). Without it
+/// the order is computed for the pointer as found, and failing that is the saved reading order.
 fn flush_workspace(host: &dyn Host, st: &mut LoadState, key: &WsKey) {
     let mut held = st.queue.take(key);
     if held.is_empty() {
         return;
     }
-    // The order is computed over every tiled save of the workspace (the saved tree), so a
-    // missing window leaves a hole rather than reshaping the others' order
+    // The tree is the workspace's whole saved tiled set, so a missing window leaves a hole
+    // rather than reshaping the others' order
     let tiled: Vec<usize> = st
         .plan
         .saved
@@ -876,23 +909,88 @@ fn flush_workspace(host: &dyn Host, st: &mut LoadState, key: &WsKey) {
             (c.at.0 as f64, c.at.1 as f64, (c.at.0 + c.size.0) as f64, (c.at.1 + c.size.1) as f64)
         })
         .collect();
-    let (order, fallback, pointer) = insertion_order(host, &rects);
-    let rank: HashMap<usize, usize> = order.iter().enumerate().map(|(r, &pos)| (tiled[pos], r)).collect();
+
+    let layout = host.option("general:layout");
+    let split = host.option("dwindle:force_split");
+    let gaps_out = option_number(host, "general:gaps_out", dwindle::DEFAULT_GAPS_OUT);
+    let mut why_not_steered = if layout.as_deref() != Some("dwindle") {
+        Some(format!("layout is {}, not dwindle", layout.as_deref().unwrap_or("unknown")))
+    } else if split.as_deref() != Some("2") {
+        Some(format!("dwindle:force_split is {}, not 2", split.as_deref().unwrap_or("unknown")))
+    } else if st.steering_refused {
+        Some("the compositor did not accept a pointer warp".to_string())
+    } else {
+        None
+    };
+
+    // Steered: (window position in `tiled`, pointer to warp to first) in insertion order
+    let mut schedule: Option<Vec<dwindle::SteerStep>> = None;
+    if why_not_steered.is_none() && rects.len() >= 2 {
+        match dwindle::steer_schedule(&rects, gaps_out, dwindle::CUT_TOLERANCE) {
+            Err(reason) => why_not_steered = Some(reason),
+            Ok(steps) => {
+                // Prove the warp works before the first window moves
+                let (x, y) = steps[1].pointer.expect("second insertion has a pointer");
+                if warp_pointer(host, x as i32, y as i32) {
+                    st.pointer_moved_by_us = true;
+                    schedule = Some(steps);
+                } else {
+                    st.steering_refused = true;
+                    println!("Warning: the compositor did not take a pointer warp (wanted {x:.0},{y:.0}); not steering");
+                    why_not_steered = Some("the compositor did not accept a pointer warp".to_string());
+                }
+            }
+        }
+    }
+
+    let rank: HashMap<usize, usize>;
+    let mut fallback: Option<String> = None;
+    let mut pointers: HashMap<usize, (i32, i32)> = HashMap::new();
+    let mut reference_pointer = None;
+    if let Some(steps) = &schedule {
+        rank = steps.iter().enumerate().map(|(r, s)| (tiled[s.window], r)).collect();
+        for step in steps {
+            if let Some((x, y)) = step.pointer {
+                pointers.insert(tiled[step.window], (x as i32, y as i32));
+            }
+        }
+    } else {
+        let (order, reason, pointer) = insertion_order(host, &rects);
+        // a steering failure is the more useful reason when the as-found order is not computable
+        fallback = reason.map(|r| match &why_not_steered {
+            Some(w) => format!("{w}; {r}"),
+            None => r,
+        });
+        reference_pointer = pointer;
+        rank = order.iter().enumerate().map(|(r, &pos)| (tiled[pos], r)).collect();
+    }
     held.sort_by_key(|h| (rank.get(&h.saved_index).copied().unwrap_or(usize::MAX), h.saved_index));
 
-    match &fallback {
-        None => println!("Workspace {}: placing {} tiled windows in computed insertion order", key.0, held.len()),
-        Some(reason) => {
+    let steered = schedule.is_some();
+    match (&fallback, steered) {
+        (_, true) => println!("Workspace {}: placing {} tiled windows in steered insertion order (pointer-independent)", key.0, held.len()),
+        (None, false) => println!("Workspace {}: placing {} tiled windows in computed insertion order", key.0, held.len()),
+        (Some(reason), false) => {
             println!("Workspace {}: placing {} tiled windows in saved reading order ({reason})", key.0, held.len())
         }
     }
     let live = host.clients().unwrap_or_default();
     let count = held.len();
+    let mut last_pointer = None;
+    let mut placed: Vec<(Address, usize)> = vec![];
     for Held { saved_index, saved, live: address } in held {
         match live.iter().find(|c| c.address == address) {
             Some(window) => {
+                if let Some(&(x, y)) = pointers.get(&saved_index) {
+                    if warp_pointer(host, x, y) {
+                        last_pointer = Some((x, y));
+                    } else {
+                        println!("Warning: pointer warp to {x},{y} was not accepted while placing '{}'", saved.title);
+                    }
+                }
                 apply(host, window, &saved);
                 st.report.placed += 1;
+                placed.push((address, saved_index));
             }
             None => {
                 println!("Warning: '{}' vanished before it was placed", saved.title);
@@ -900,14 +998,45 @@ fn flush_workspace(host: &dyn Host, st: &mut LoadState, key: &WsKey) {
             }
         }
     }
-    let pointer_moved = match (pointer, host.cursor_pos()) {
-        (Some(before), Some(after)) => before != after,
+
+    // The pointer is only suspect if something other than the loader moved it
+    let pointer_moved = match (last_pointer.or(reference_pointer), host.cursor_pos()) {
+        (Some((bx, by)), Some((ax, ay))) => (bx - ax).abs() > WARP_TOLERANCE || (by - ay).abs() > WARP_TOLERANCE,
         _ => false,
     };
     if pointer_moved {
         println!("Warning: the pointer moved while workspace {} was placed; its order may not have been reproduced", key.0);
     }
-    st.report.flushes.push(FlushReport { workspace: key.0, windows: count, fallback, pointer_moved });
+
+    // Read the geometry back: the load's own evidence that the tree was reproduced
+    let verified = if placed.is_empty() {
+        None
+    } else {
+        host.pause();
+        host.clients().ok().map(|after| {
+            let ok = placed
+                .iter()
+                .filter(|(address, index)| {
+                    let saved = &st.plan.saved[*index];
+                    after.iter().find(|c| c.address == *address).is_some_and(|c| {
+                        (c.at.0 as i32 - saved.at.0 as i32).abs() <= GEOMETRY_TOLERANCE
+                            && (c.at.1 as i32 - saved.at.1 as i32).abs() <= GEOMETRY_TOLERANCE
+                            && (c.size.0 as i32 - saved.size.0 as i32).abs() <= GEOMETRY_TOLERANCE
+                            && (c.size.1 as i32 - saved.size.1 as i32).abs() <= GEOMETRY_TOLERANCE
+                    })
+                })
+                .count();
+            (ok, placed.len())
+        })
+    };
+    if let Some((ok, checked)) = verified {
+        if ok == checked {
+            println!("Workspace {}: {ok} of {checked} tiled windows are at their saved geometry", key.0);
+        } else {
+            println!("Warning: workspace {}: only {ok} of {checked} tiled windows are at their saved geometry", key.0);
+        }
+    }
+    st.report.flushes.push(FlushReport { workspace: key.0, windows: count, fallback, steered, pointer_moved, verified });
 }
 
 /// Flush every workspace whose queue is ready
@@ -1026,6 +1155,9 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
         placer: Placer::new(if plan.place_by_class { plan.saved.clone() } else { vec![] }),
         queue: if plan.place_by_class { PlacementQueue::new(&plan.saved, &plan.entries) } else { PlacementQueue::disabled() },
         protected,
+        pointer_home: if plan.place_by_class { host.cursor_pos() } else { None },
+        pointer_moved_by_us: false,
+        steering_refused: false,
         reserved: if plan.place_by_class {
             plan.entries.iter().filter(|e| is_resume_entry(e)).filter_map(|e| e.group.as_ref()).flat_map(|g| g.saved.iter().copied()).collect()
         } else {
@@ -1096,6 +1228,12 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
         }
     }
 
+    // The loader steered the pointer for the duration of the load: put it back
+    if let (true, Some((x, y))) = (st.pointer_moved_by_us, st.pointer_home) {
+        if !warp_pointer(host, x, y) {
+            println!("Warning: could not put the pointer back at {x},{y}");
+        }
+    }
     if let Some(workspace) = plan.restore_workspace {
         let _ = host.send(&Op::FocusWorkspace(workspace));
     }
@@ -1402,6 +1540,11 @@ mod tests {
         drift_to: Cell<Option<(i32, i32)>>,
         /// (number of Execs sent, address): the window disappears once that many launches happened
         hide: RefCell<Option<(usize, String)>>,
+        /// Whether the compositor accepts a pointer warp
+        warp: Cell<bool>,
+        /// A dwindle layout simulation: moving a window onto a workspace splits the leaf nearest the pointer
+        sim: Cell<bool>,
+        leaves: RefCell<std::collections::HashMap<i32, Vec<(Address, crate::dwindle::Rect)>>>,
     }
 
     impl FakeHost {
@@ -1418,6 +1561,43 @@ mod tests {
                 cursor: Cell::new(None),
                 drift_to: Cell::new(None),
                 hide: RefCell::new(None),
+                warp: Cell::new(true),
+                sim: Cell::new(false),
+                leaves: RefCell::new(Default::default()),
+            }
+        }
+
+        /// Dwindle as measured in spike #2: the new window splits the leaf nearest the pointer
+        /// (ties: the oldest) along its longer side and becomes the second child
+        fn sim_insert(&self, window: &Address, ws: i32) {
+            const SCREEN: crate::dwindle::Rect = (0.0, 26.0, 1920.0, 1080.0);
+            let (px, py) = self.cursor.get().map(|(x, y)| (x as f64, y as f64)).unwrap_or((0.0, 0.0));
+            let mut leaves = self.leaves.borrow_mut();
+            let tree = leaves.entry(ws).or_default();
+            if tree.is_empty() {
+                tree.push((window.clone(), SCREEN));
+            } else {
+                let target = (0..tree.len())
+                    .min_by(|&a, &b| {
+                        let da = crate::dwindle::distance((px, py), tree[a].1);
+                        let db = crate::dwindle::distance((px, py), tree[b].1);
+                        da.partial_cmp(&db).unwrap()
+                    })
+                    .unwrap();
+                let (_, first, second) = crate::dwindle::split_box(tree[target].1);
+                tree[target].1 = first;
+                tree.push((window.clone(), second));
+            }
+            // every window of the workspace takes the geometry of its leaf (12 px at the screen edge, 7 between)
+            let inset = |edge: f64, at: f64| if (edge - at).abs() < 0.5 { 12.0 } else { 7.0 };
+            for (address, b) in tree.iter() {
+                let (x0, y0, x1, y1) = (b.0 + inset(b.0, SCREEN.0), b.1 + inset(b.1, SCREEN.1), b.2 - inset(b.2, SCREEN.2), b.3 - inset(b.3, SCREEN.3));
+                for (_, c) in self.windows.borrow_mut().iter_mut().filter(|(_, c)| c.address == *address) {
+                    c.workspace.id = ws;
+                    c.workspace.name = ws.to_string();
+                    c.at = (x0 as i16, y0 as i16);
+                    c.size = ((x1 - x0) as i16, (y1 - y0) as i16);
+                }
             }
         }
 
@@ -1454,6 +1634,12 @@ mod tests {
                 self.windows.borrow_mut().retain(|(_, c)| {
                     !(c.address == *addr && resist.get(&c.pid).copied().unwrap_or(0) == 0)
                 });
+            }
+            if let (Op::MoveToWorkspace { window, workspace: crate::dispatch::WorkspaceTarget::Id(ws) }, true) = (op, self.sim.get()) {
+                self.sim_insert(window, *ws);
+            }
+            if let (Op::MoveCursor { x, y }, true) = (op, self.warp.get()) {
+                self.cursor.set(Some((*x, *y)));
             }
             if let (Op::MoveToWorkspace { .. }, Some(to)) = (op, self.drift_to.get()) {
                 self.cursor.set(Some(to));
@@ -1997,7 +2183,7 @@ mod tests {
             let report = run_load(&host, &plan_for(entries, saves.clone()));
             assert_eq!(moved(&host), expected, "arrival {arrival:?}");
             assert_eq!(report.placed, 4);
-            assert_eq!(report.flushes, vec![FlushReport { workspace: 2, windows: 4, fallback: None, pointer_moved: false }]);
+            assert_eq!((report.flushes[0].steered, report.flushes[0].fallback.clone(), report.flushes[0].pointer_moved), (true, None, false));
         }
     }
 
@@ -2007,6 +2193,7 @@ mod tests {
         let saves = tiled_saves(2, &S4);
         let (entries, scripts) = launching(&saves, &[0, 1, 2, 3]);
         let host = FakeHost::new(vec![], scripts).dwindle();
+        host.warp.set(false);
         host.cursor.set(Some((1500, 200)));
         let report = run_load(&host, &plan_for(entries, saves));
         // reading order: x, then y -> indices 0, 2, 3, 1
@@ -2020,6 +2207,7 @@ mod tests {
         for (key, value) in [("general:layout", "master"), ("dwindle:force_split", "0")] {
             let (entries, scripts) = launching(&saves, &[0, 1, 2, 3]);
             let host = FakeHost::new(vec![], scripts).dwindle();
+            host.warp.set(false);
             host.options.borrow_mut().insert(key.into(), value.into());
             let report = run_load(&host, &plan_for(entries, saves.clone()));
             assert_eq!(moved(&host), vec!["0xa00", "0xa02", "0xa03", "0xa01"], "{key}={value}");
@@ -2287,5 +2475,130 @@ mod tests {
         assert_eq!(placer.assign_bound(&w(0), &[1], &reserved).unwrap().0, 1);
         assert_eq!(placer.assign_bound(&w(1), &[], &reserved).unwrap().0, 2);
         assert_eq!(placer.assign_bound(&w(2), &[], &reserved).unwrap().0, 0);
+    }
+
+    // ---- R2/R3: pointer-independent reproduction, one-generation convergence
+
+    // The WS9 trees of playtest round 2 (window rectangles x0, y0, x1, y1): the same three windows
+    const WS9_B: [(i16, i16, i16, i16); 3] = [(12, 38, 953, 546), (12, 560, 953, 1068), (967, 38, 1908, 1068)];
+    const WS9_C: [(i16, i16, i16, i16); 3] = [(12, 38, 953, 1068), (967, 38, 1908, 546), (967, 560, 1908, 1068)];
+
+    fn shape_saves(ws: i32, shape: &[(i16, i16, i16, i16)]) -> Vec<Client> {
+        let rects: Vec<_> = shape.iter().map(|&(x0, y0, x1, y1)| (x0, y0, x1 - x0, y1 - y0)).collect();
+        tiled_saves(ws, &rects)
+    }
+
+    /// One load of `saves` onto the simulated compositor with the pointer at `pointer`; returns the
+    /// "next save" (the saved clients with the geometry the compositor then reports), the report
+    /// and the host
+    fn simulated_load(saves: &[Client], pointer: (i32, i32), warp: bool) -> (Vec<Client>, LoadReport, FakeHost) {
+        let launch: Vec<usize> = (0..saves.len()).collect();
+        let (entries, scripts) = launching(saves, &launch);
+        let host = FakeHost::new(vec![], scripts).dwindle();
+        host.sim.set(true);
+        host.warp.set(warp);
+        host.cursor.set(Some(pointer));
+        let report = run_load(&host, &plan_for(entries, saves.to_vec()));
+        let windows = host.windows.borrow();
+        let next = saves
+            .iter()
+            .enumerate()
+            .map(|(i, saved)| {
+                let live = &windows.iter().find(|(_, c)| c.address.to_string() == format!("0xa{i:02x}")).unwrap().1;
+                let mut next = saved.clone();
+                next.at = live.at;
+                next.size = live.size;
+                next
+            })
+            .collect();
+        drop(windows);
+        (next, report, host)
+    }
+
+    fn geometry(clients: &[Client]) -> Vec<((i16, i16), (i16, i16))> {
+        clients.iter().map(|c| (c.at, c.size)).collect()
+    }
+
+    #[test]
+    fn test_untreeable_by_growth_shape_round_trips_whatever_the_pointer() {
+        // WS9's tree (full-height left, stack right) cannot be grown at a left-hand pointer by
+        // insertion order alone; steering makes the pointer irrelevant
+        let pointers = [(300, 900), (561, 424), (1437, 553), (1500, 200), (960, 540), (100, 100)];
+        for shape in [&WS9_B[..], &WS9_C[..]] {
+            let a = shape_saves(7, shape);
+            for &pointer in &pointers {
+                let (b, report, host) = simulated_load(&a, pointer, true);
+                assert_eq!(geometry(&b), geometry(&a), "pointer {pointer:?}: load of A");
+                assert!(report.flushes[0].steered);
+                assert_eq!(report.flushes[0].verified, Some((3, 3)));
+                // the pointer is where the user left it
+                assert_eq!(host.cursor.get(), Some(pointer));
+                // and the next generation, with the pointer somewhere else again, is identical
+                let (c, _, _) = simulated_load(&b, (1437, 553), true);
+                assert_eq!(geometry(&c), geometry(&b), "pointer {pointer:?}: load of B");
+            }
+        }
+    }
+
+    #[test]
+    fn test_unsteered_load_cannot_reproduce_the_shape_which_is_what_steering_fixes() {
+        // control: the same load with the pointer warp refused leaves the tree to the pointer
+        let a = shape_saves(7, &WS9_C);
+        let (b, report, _) = simulated_load(&a, (300, 900), false);
+        assert_ne!(geometry(&b), geometry(&a));
+        assert!(!report.flushes[0].steered);
+        assert_eq!(report.flushes[0].verified.map(|(ok, n)| ok < n), Some(true), "the load notices");
+    }
+
+    #[test]
+    fn test_a_workspace_placed_by_fallback_saves_back_identically_next_generation() {
+        // R3: generation N cannot steer (warp refused) and falls back; whatever it produced is a
+        // tree the next generation reproduces exactly, at any pointer
+        let a = shape_saves(7, &WS9_C);
+        let (b, report, _) = simulated_load(&a, (300, 900), false);
+        assert!(report.flushes[0].fallback.is_some());
+        for pointer in [(300, 900), (1437, 553), (561, 424)] {
+            let (c, report, _) = simulated_load(&b, pointer, true);
+            assert_eq!(geometry(&c), geometry(&b), "pointer {pointer:?}");
+            assert!(report.flushes[0].steered);
+        }
+    }
+
+    #[test]
+    fn test_larger_trees_round_trip_steered() {
+        for n in 2..=6 {
+            let a = shape_saves(10, &grown_shape(n, (1437, 553)));
+            let (b, _, _) = simulated_load(&a, (100, 100), true);
+            assert_eq!(geometry(&b), geometry(&a), "n={n}");
+        }
+    }
+
+    /// Window rectangles of an n-window tree grown by the same pointer-nearest rule
+    fn grown_shape(n: usize, pointer: (i32, i32)) -> Vec<(i16, i16, i16, i16)> {
+        let saves = tiled_saves(10, &vec![(0, 0, 1, 1); n]);
+        let launch: Vec<usize> = (0..n).collect();
+        let (entries, scripts) = launching(&saves, &launch);
+        let host = FakeHost::new(vec![], scripts).dwindle();
+        host.sim.set(true);
+        host.warp.set(false);
+        host.cursor.set(Some(pointer));
+        let mut plan = plan_for(entries, saves);
+        plan.saved = (0..n).map(|i| client(&format!("app{i}"), "t", 10, false, (0, 0), (1, 1))).collect();
+        run_load(&host, &plan);
+        let out = host.windows.borrow().iter().map(|(_, c)| (c.at.0, c.at.1, c.at.0 + c.size.0, c.at.1 + c.size.1)).collect();
+        out
+    }
+
+    #[test]
+    fn test_the_pointer_is_restored_and_a_refused_warp_is_reported_once() {
+        let a = shape_saves(7, &WS9_C);
+        let (_, report, host) = simulated_load(&a, (123, 456), true);
+        assert_eq!(host.cursor.get(), Some((123, 456)));
+        assert!(!report.flushes[0].pointer_moved);
+        // refused warp: nothing is attempted twice across workspaces, nothing is "restored"
+        let (_, _, host) = simulated_load(&a, (123, 456), false);
+        assert_eq!(host.cursor.get(), Some((123, 456)));
+        let warps = host.sent.borrow().iter().filter(|o| matches!(o, Op::MoveCursor { .. })).count();
+        assert_eq!(warps, 3, "one refused warp is retried three times, then given up");
     }
 }

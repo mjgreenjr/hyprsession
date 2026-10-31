@@ -506,3 +506,39 @@ mod resume_file_tests {
         assert!(text.contains("hyprsession-resume"), "{text}");
     }
 }
+
+mod detached_load {
+    use std::process::Command;
+
+    #[test]
+    fn test_load_runs_detached_logs_to_a_file_and_returns_its_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_hyprsession"))
+            .args(["load", "nosuch", "--dialect", "classic"])
+            .env("HYPRSESSION_PATH", dir.path())
+            .env_remove("HYPRSESSION_DETACHED")
+            .env_remove("HYPRSESSION_NO_DETACH")
+            .output()
+            .unwrap();
+        let shown = String::from_utf8_lossy(&output.stdout).to_string();
+        // the follower says so, relays the detached load's output, and exits with its status
+        assert!(shown.contains("Load running detached"), "{shown}");
+        assert!(shown.contains("Using session path"), "{shown}");
+        assert_eq!(output.status.code(), Some(1), "{shown}");
+        let log = std::fs::read_to_string(dir.path().join("load.log")).unwrap();
+        assert!(log.contains("Using session path") && log.contains("exec.conf"), "{log}");
+    }
+
+    #[test]
+    fn test_load_runs_in_the_foreground_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_hyprsession"))
+            .args(["load", "nosuch", "--dialect", "classic"])
+            .env("HYPRSESSION_PATH", dir.path())
+            .env("HYPRSESSION_NO_DETACH", "1")
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("detached"));
+        assert!(!dir.path().join("load.log").exists());
+    }
+}

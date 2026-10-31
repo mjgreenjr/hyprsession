@@ -1,4 +1,5 @@
 use std::fs::create_dir_all;
+use std::io::Write;
 use std::process::exit;
 use std::{env, thread, time};
 //use serde::Deserialize;
@@ -6,6 +7,7 @@ use clap::{Parser, ValueEnum};
 
 pub mod command_detection;
 pub mod command_faker;
+pub mod detach;
 pub mod dispatch;
 pub mod dwindle;
 pub mod queue;
@@ -111,8 +113,29 @@ fn main() -> hyprland::Result<()> {
         env::var("HOME").unwrap() + "/.local/share/hyprsession"
     };
 
-    println!("Using session path: {}", session_path);
     create_dir_all(&session_path).expect(&format!("Failed to create session dir: {session_path}"));
+
+    // A load closes the terminal it was typed in: run it in its own session, writing to a log,
+    // and only follow that log from here
+    if args.mode == Mode::Load && !args.simulate && detach::should_detach() {
+        let log = std::path::Path::new(&session_path).join("load.log");
+        match env::current_exe().map(|exe| {
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args(env::args().skip(1));
+            cmd
+        }) {
+            Ok(cmd) => match detach::spawn_detached(cmd, &log) {
+                Ok(mut child) => {
+                    let _ = writeln!(std::io::stdout(), "Load running detached (pid {}); log: {}", child.id(), log.display());
+                    exit(detach::follow(&mut child, &log, &mut std::io::stdout()));
+                }
+                Err(e) => eprintln!("Warning: could not detach the load ({e}); running it in this terminal"),
+            },
+            Err(e) => eprintln!("Warning: could not detach the load ({e}); running it in this terminal"),
+        }
+    }
+
+    println!("Using session path: {}", session_path);
     migration_check(&session_path);
 
     if args.save_interval == 0 {

@@ -456,13 +456,17 @@ fn print_placement_order(saved: &[Client]) {
 /// Report how each workspace's tiled windows were ordered, and why any fell back to reading order
 fn print_flushes(flushes: &[crate::load::FlushReport]) {
     for flush in flushes {
-        match &flush.fallback {
-            None => println!("Workspace {}: {} tiled windows placed in computed insertion order", flush.workspace, flush.windows),
-            Some(reason) => println!(
-                "Workspace {}: {} tiled windows placed in saved reading order ({reason}); the layout may not reproduce",
-                flush.workspace, flush.windows
-            ),
-        }
+        let how = match (&flush.fallback, flush.steered) {
+            (_, true) => "steered insertion order (pointer-independent)".to_string(),
+            (None, false) => "computed insertion order".to_string(),
+            (Some(reason), false) => format!("saved reading order ({reason}); the layout may not reproduce"),
+        };
+        let seen = match flush.verified {
+            Some((ok, checked)) if ok == checked => format!("; all {checked} at their saved geometry"),
+            Some((ok, checked)) => format!("; only {ok} of {checked} at their saved geometry"),
+            None => String::new(),
+        };
+        println!("Workspace {}: {} tiled windows placed in {how}{seen}", flush.workspace, flush.windows);
         if flush.pointer_moved {
             println!("  the pointer moved during placement; the order may not have been reproduced");
         }

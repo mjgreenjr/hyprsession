@@ -1,6 +1,7 @@
 pub mod session;
 pub mod command_detection;
 pub mod command_faker;
+pub mod detach;
 pub mod dispatch;
 pub mod dwindle;
 pub mod load;
