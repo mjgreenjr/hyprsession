@@ -181,6 +181,13 @@ pointer exactly on a boundary) the workspace falls back to the saved reading ord
 fallback produces is still one the next load reproduces exactly. Windows destined for the workspace that is visible
 when the load starts are not moved and keep their arrival position. Dragged (non-50/50) dividers are not restored.
 
+A workspace is placed only when all its tiled windows have arrived (or at the end of the load), never half built, and
+each window is bound to the launch that produced it by reading its process (`/proc`) rather than by arrival time or
+title, so a slow window cannot be mistaken for another entry's. The workspace that was visible when the load began
+gets special care: its windows are born there in arrival order, so at the end they are moved off to a hidden stage
+and back in the steered order. The geometry check runs once, after everything is placed, and reports each workspace.
+The pointer's position is captured before the load closes anything and put back after the final focus change.
+
 ## Loading survives its terminal
 `hyprsession load` closes every window, including the terminal it was typed in. It therefore re-runs itself in its own
 session (no controlling terminal, SIGHUP ignored), writing to `load.log` in the session directory, and the command you

@@ -289,7 +289,7 @@ pub fn plan_adjustment(real_client: &Client, session_client: &Client) -> Vec<Op>
 impl LocalSession {
     fn clear_scope(&self, scope: Scope) -> hyprland::Result<()> {
         if !self.simulate {
-            let host = RealHost { dispatcher: Dispatcher::new(self.dialect, false) };
+            let host = RealHost::new(Dispatcher::new(self.dialect, false));
             let report = clear_windows(&host, &ClearConfig::default(), scope)
                 .map_err(hyprland::error::HyprError::Other)?;
             if !report.refused.is_empty() {
@@ -461,14 +461,26 @@ fn print_flushes(flushes: &[crate::load::FlushReport]) {
             (None, false) => "computed insertion order".to_string(),
             (Some(reason), false) => format!("saved reading order ({reason}); the layout may not reproduce"),
         };
-        let seen = match flush.verified {
-            Some((ok, checked)) if ok == checked => format!("; all {checked} at their saved geometry"),
-            Some((ok, checked)) => format!("; only {ok} of {checked} at their saved geometry"),
-            None => String::new(),
-        };
-        println!("Workspace {}: {} tiled windows placed in {how}{seen}", flush.workspace, flush.windows);
+        println!("Workspace {}: {} tiled windows placed in {how}", flush.workspace, flush.windows);
         if flush.pointer_moved {
             println!("  the pointer moved during placement; the order may not have been reproduced");
+        }
+    }
+}
+
+/// The final geometry check, one line per workspace, read after every placement was done
+fn print_verification(checks: &[crate::load::WorkspaceCheck]) {
+    for check in checks {
+        if check.at_saved == check.checked {
+            println!("Workspace {}: all {} tiled windows are at their saved geometry", check.workspace, check.checked);
+        } else {
+            println!(
+                "Warning: workspace {}: only {} of {} tiled windows are at their saved geometry (off: {})",
+                check.workspace,
+                check.at_saved,
+                check.checked,
+                check.off.join(", ")
+            );
         }
     }
 }
@@ -575,16 +587,18 @@ impl Session for LocalSession {
         if self.simulate {
             simulate_load(&dispatcher, &plan);
         } else {
+            // The pointer's starting position is captured here, before anything is closed
+            let host = RealHost::new(dispatcher);
             if !self.adjust_clients_only {
                 match self.workspace {
                     Some(workspace) => self.clear_scope(Scope::Workspace(workspace))?,
                     None => self.clear()?,
                 }
             }
-            let host = RealHost { dispatcher };
             let report = run_load(&host, &plan);
             println!("Placed {} windows, {} saved windows not matched", report.placed, report.unmatched.len());
             print_flushes(&report.flushes);
+            print_verification(&report.verification);
             print_shortfalls(&report.shortfalls, &report.unmatched);
             print_surplus(&report.surplus);
         }

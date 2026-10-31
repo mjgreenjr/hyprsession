@@ -27,6 +27,9 @@ pub struct Held {
 #[derive(Debug, Default)]
 pub struct PlacementQueue {
     enabled: bool,
+    /// Launches are still to run: a workspace then waits for every tiled save (or the end of the
+    /// load) rather than for a launch phase to end, because windows arrive after their phase
+    launching: bool,
     /// Tiled saved clients per workspace
     expected: HashMap<WsKey, usize>,
     held: HashMap<WsKey, Vec<Held>>,
@@ -50,7 +53,7 @@ impl PlacementQueue {
 
     /// `entries`: the launch entries still to run (empty when only adjusting)
     pub fn new(saved: &[Client], entries: &[ExecEntry]) -> Self {
-        let mut queue = PlacementQueue { enabled: true, ..Default::default() };
+        let mut queue = PlacementQueue { enabled: true, launching: !entries.is_empty(), ..Default::default() };
         for client in saved.iter().filter(|c| is_queued(c)) {
             *queue.expected.entry(ws_key(client)).or_default() += 1;
         }
@@ -80,6 +83,10 @@ impl PlacementQueue {
         self.held.entry(ws_key(&held.saved)).or_default().push(held);
     }
 
+    pub fn is_launching(&self) -> bool {
+        self.launching
+    }
+
     pub fn held_count(&self) -> usize {
         self.held.values().map(Vec::len).sum()
     }
@@ -102,8 +109,11 @@ impl PlacementQueue {
         self.pending.get(key).copied().unwrap_or(0) + self.ungrouped_pending
     }
 
-    /// Workspaces to flush now, in a stable order: every tiled save claimed, or no launch
-    /// entry left that could still bring a window (and something is held)
+    /// Workspaces to flush now, in a stable order: every tiled save claimed. With nothing left to
+    /// launch (adjust-only) whatever is held is placed at once. While launching, an incomplete
+    /// workspace waits for the end of the load: a launch phase ending does not mean its window
+    /// has arrived (slow apps, other launches' late windows), and a workspace flushed before its
+    /// full membership exists cannot regrow its tree.
     pub fn ready(&self) -> Vec<WsKey> {
         let mut keys: Vec<WsKey> = self
             .held
@@ -111,7 +121,7 @@ impl PlacementQueue {
             .filter(|(key, held)| {
                 !held.is_empty()
                     && !self.flushed.contains(*key)
-                    && (held.len() >= self.expected.get(*key).copied().unwrap_or(0) || self.pending_for(key) == 0)
+                    && (held.len() >= self.expected.get(*key).copied().unwrap_or(0) || (!self.launching && self.pending_for(key) == 0))
             })
             .map(|(key, _)| key.clone())
             .collect();
@@ -183,14 +193,15 @@ mod tests {
     }
 
     #[test]
-    fn test_flushes_at_phase_end_and_not_before() {
+    fn test_an_incomplete_workspace_waits_for_the_end_of_the_load_while_launching() {
         let s = vec![saved(2, "2", false), saved(2, "2", false)];
         let e = entry(vec![0, 1]);
         let mut queue = PlacementQueue::new(&s, std::slice::from_ref(&e));
         queue.hold(held(0, s[0].clone()));
         assert!(queue.ready().is_empty(), "an entry is still pending for the workspace");
         queue.entry_done(&s, &e);
-        assert_eq!(queue.ready(), vec![(2, "2".to_string())]);
+        assert!(queue.ready().is_empty(), "the phase ending does not mean the window has arrived");
+        assert_eq!(queue.all_held(), vec![(2, "2".to_string())], "the end-of-load flush still takes it");
     }
 
     #[test]
@@ -201,7 +212,9 @@ mod tests {
         let mut queue = PlacementQueue::new(&s, &[e1.clone(), e2.clone()]);
         queue.hold(held(0, s[0].clone()));
         queue.entry_done(&s, &e1);
-        assert_eq!(queue.ready(), vec![(1, "1".to_string())]);
+        assert!(queue.ready().is_empty(), "ws 1 has one tiled save still to come");
+        queue.hold(held(1, s[1].clone()));
+        assert_eq!(queue.ready(), vec![(1, "1".to_string())], "complete: flushed without waiting for ws 2's launch");
     }
 
     #[test]
@@ -215,7 +228,7 @@ mod tests {
         let mut queue = PlacementQueue::new(&[s[0].clone(), saved(2, "2", false), saved(2, "2", false)], std::slice::from_ref(&e));
         queue.hold(held(0, s[0].clone()));
         queue.entry_done(&s, &e);
-        assert_eq!(queue.ready(), vec![(1, "1".to_string())]);
+        assert_eq!(queue.ready(), vec![(1, "1".to_string())], "ws 1 is complete; ws 2 still waits");
     }
 
     #[test]
@@ -226,6 +239,8 @@ mod tests {
         queue.hold(held(0, s[0].clone()));
         assert!(queue.ready().is_empty());
         queue.entry_done(&s, &e);
+        assert!(queue.ready().is_empty(), "launching: waits for the full set");
+        queue.hold(held(1, s[1].clone()));
         assert_eq!(queue.ready().len(), 1);
     }
 

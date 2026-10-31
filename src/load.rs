@@ -499,6 +499,18 @@ pub struct LoadReport {
     pub shortfalls: Vec<GroupShortfall>,
     /// One entry per workspace whose tiled windows were placed together
     pub flushes: Vec<FlushReport>,
+    /// Per workspace, read once after every placement is done: tiled windows at their saved geometry
+    pub verification: Vec<WorkspaceCheck>,
+}
+
+/// Final-state geometry check of one workspace's tiled windows
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceCheck {
+    pub workspace: i32,
+    pub at_saved: usize,
+    pub checked: usize,
+    /// Titles of the windows that are not at their saved geometry
+    pub off: Vec<String>,
 }
 
 /// How one workspace's queued tiled windows were ordered
@@ -513,8 +525,6 @@ pub struct FlushReport {
     pub steered: bool,
     /// The pointer was somewhere else than the loader left it: the order may not have been reproduced
     pub pointer_moved: bool,
-    /// (windows at their saved geometry, windows checked) read back from the compositor after the flush
-    pub verified: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -523,6 +533,13 @@ pub struct GroupShortfall {
     pub expected: usize,
     pub got: usize,
     pub reinvocations: usize,
+}
+
+/// A window's process as /proc shows it
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessInfo {
+    pub argv: Vec<String>,
+    pub cwd: Option<String>,
 }
 
 /// The compositor as load sees it
@@ -539,6 +556,14 @@ pub trait Host {
     fn cursor_pos(&self) -> Option<(i32, i32)> {
         None
     }
+    /// What a window's process is running (argv, working directory): launch provenance
+    fn process(&self, _pid: i32) -> Option<ProcessInfo> {
+        None
+    }
+    /// Where the pointer was before the load touched anything (defaults to where it is now)
+    fn pointer_origin(&self) -> Option<(i32, i32)> {
+        self.cursor_pos()
+    }
     /// A compositor option such as `general:layout`, as text
     fn option(&self, _key: &str) -> Option<String> {
         None
@@ -553,6 +578,15 @@ pub enum Signal {
 
 pub struct RealHost {
     pub dispatcher: Dispatcher,
+    /// The pointer when the host was created: capture it before a load clears anything
+    origin: Option<(i32, i32)>,
+}
+
+impl RealHost {
+    pub fn new(dispatcher: Dispatcher) -> Self {
+        let origin = hyprland::data::CursorPosition::get().ok().map(|c| (c.x as i32, c.y as i32));
+        RealHost { dispatcher, origin }
+    }
 }
 
 impl Host for RealHost {
@@ -578,6 +612,14 @@ impl Host for RealHost {
 
     fn pause(&self) {
         std::thread::sleep(std::time::Duration::from_millis(1000 / TICKS_PER_SECOND));
+    }
+
+    fn pointer_origin(&self) -> Option<(i32, i32)> {
+        self.origin
+    }
+
+    fn process(&self, pid: i32) -> Option<ProcessInfo> {
+        Some(ProcessInfo { argv: crate::command_detection::read_argv(pid)?, cwd: crate::command_detection::read_cwd(pid) })
     }
 
     fn cursor_pos(&self) -> Option<(i32, i32)> {
@@ -798,6 +840,16 @@ struct LoadState<'a> {
     /// Where the user's pointer was when the load began (restored at the end if the loader moved it)
     pointer_home: Option<(i32, i32)>,
     pointer_moved_by_us: bool,
+    /// The workspace that was visible when the load began: windows are born on it
+    start_ws: Option<i32>,
+    /// Launch entries started so far
+    launched: usize,
+    /// What each entry's process looks like (argv, working directory), for launch provenance
+    signatures: Vec<Option<(Vec<String>, Option<String>)>>,
+    /// The entry whose process owns a window, established from /proc, not from timing
+    owners: HashMap<Address, usize>,
+    /// Every tiled claim that was placed: (live window, saved index), for the final geometry check
+    placed_tiled: Vec<(Address, usize)>,
     /// The compositor did not take a pointer warp: no more are attempted
     steering_refused: bool,
     /// Saved windows that a resume launch (a terminal under the hyprsession wrapper) will bring up
@@ -811,6 +863,63 @@ struct LoadState<'a> {
 struct Phase<'a> {
     before: &'a HashSet<Address>,
     own: &'a [usize],
+    /// Index of the entry being waited for
+    index: usize,
+}
+
+/// The special workspace windows are parked on while the workspace they were born on is rebuilt
+const STAGE: &str = "hyprsession-stage";
+
+/// The process an entry's command starts: its argv and, for `cd <dir> && <command>`, its directory
+fn entry_signature(entry: &ExecEntry) -> Option<(Vec<String>, Option<String>)> {
+    let words = crate::command_detection::shell_split(&entry.command);
+    let (cwd, rest) = match words.as_slice() {
+        [cd, dir, and, rest @ ..] if cd == "cd" && and == "&&" => (Some(dir.clone()), rest.to_vec()),
+        _ => (None, words),
+    };
+    if rest.is_empty() { None } else { Some((rest, cwd)) }
+}
+
+fn process_matches(signature: &(Vec<String>, Option<String>), info: &ProcessInfo) -> bool {
+    let (argv, cwd) = signature;
+    let base = |s: &String| s.rsplit('/').next().unwrap_or(s).to_string();
+    info.argv.len() == argv.len()
+        && base(&info.argv[0]) == base(&argv[0])
+        && info.argv[1..] == argv[1..]
+        && cwd.as_ref().map_or(true, |dir| info.cwd.as_deref() == Some(dir.as_str()))
+}
+
+/// A window belongs to the entry whose process it is; one that belongs to another entry does not
+/// count for, and is not bound to, the entry being waited for
+fn counts_for(st: &LoadState, address: &Address, entry: usize) -> bool {
+    st.owners.get(address).map_or(true, |&owner| owner == entry)
+}
+
+/// Establish which launched entry owns each window not yet attributed. Only provable from /proc:
+/// a window whose process matches no launched entry stays unattributed (timing and class decide).
+fn attribute_owners(host: &dyn Host, st: &mut LoadState, live: &[Client]) {
+    for window in live.iter().filter(|c| c.mapped && !st.protected.contains(&c.address)) {
+        if st.owners.contains_key(&window.address) {
+            continue;
+        }
+        let Some(info) = host.process(window.pid) else { continue };
+        let mut best: Option<(usize, bool)> = None;
+        for index in 0..st.launched.min(st.signatures.len()) {
+            let Some(signature) = &st.signatures[index] else { continue };
+            if !process_matches(signature, &info) {
+                continue;
+            }
+            let capacity = st.plan.entries[index].group.as_ref().map_or(0, |g| g.saved.len())
+                > st.owners.values().filter(|&&o| o == index).count();
+            // the earliest matching entry that can still take a window; else the earliest match
+            if best.map_or(true, |(_, had)| capacity && !had) {
+                best = Some((index, capacity));
+            }
+        }
+        if let Some((index, _)) = best {
+            st.owners.insert(window.address.clone(), index);
+        }
+    }
 }
 
 /// Entries that run a resumed program under the wrapper identify their window by what they
@@ -974,10 +1083,36 @@ fn flush_workspace(host: &dyn Host, st: &mut LoadState, key: &WsKey) {
             println!("Workspace {}: placing {} tiled windows in saved reading order ({reason})", key.0, held.len())
         }
     }
+    // The workspace the load started on: its windows were born in its tree in arrival order, among
+    // the staged windows of other workspaces that have since left. Moving them all off and back in
+    // schedule order, with the pointer steered, rebuilds the tree they were saved in.
+    if steered && Some(key.0) == st.start_ws {
+        let now = host.clients().unwrap_or_default();
+        let here: Vec<&Client> = now.iter().filter(|c| c.mapped && !c.floating && c.workspace.id == key.0).collect();
+        let mine: HashSet<&Address> = held.iter().map(|h| &h.live).collect();
+        let born_here = here.iter().filter(|c| mine.contains(&c.address)).count();
+        if born_here > 0 {
+            if here.iter().all(|c| mine.contains(&c.address)) {
+                println!("Workspace {}: parking its {born_here} windows to rebuild their tree in order", key.0);
+                for window in here.iter().filter(|c| mine.contains(&c.address)) {
+                    let _ = host.send(&Op::MoveToWorkspace {
+                        window: window.address.clone(),
+                        workspace: crate::dispatch::WorkspaceTarget::Special(STAGE.to_string()),
+                    });
+                }
+                host.pause();
+            } else {
+                println!(
+                    "Warning: workspace {} holds {} other windows; its tree is left in arrival order",
+                    key.0,
+                    here.len() - born_here
+                );
+            }
+        }
+    }
     let live = host.clients().unwrap_or_default();
     let count = held.len();
     let mut last_pointer = None;
-    let mut placed: Vec<(Address, usize)> = vec![];
     for Held { saved_index, saved, live: address } in held {
         match live.iter().find(|c| c.address == address) {
             Some(window) => {
@@ -990,7 +1125,7 @@ fn flush_workspace(host: &dyn Host, st: &mut LoadState, key: &WsKey) {
                 }
                 apply(host, window, &saved);
                 st.report.placed += 1;
-                placed.push((address, saved_index));
+                st.placed_tiled.push((address, saved_index));
             }
             None => {
                 println!("Warning: '{}' vanished before it was placed", saved.title);
@@ -1008,46 +1143,26 @@ fn flush_workspace(host: &dyn Host, st: &mut LoadState, key: &WsKey) {
         println!("Warning: the pointer moved while workspace {} was placed; its order may not have been reproduced", key.0);
     }
 
-    // Read the geometry back: the load's own evidence that the tree was reproduced
-    let verified = if placed.is_empty() {
-        None
-    } else {
-        host.pause();
-        host.clients().ok().map(|after| {
-            let ok = placed
-                .iter()
-                .filter(|(address, index)| {
-                    let saved = &st.plan.saved[*index];
-                    after.iter().find(|c| c.address == *address).is_some_and(|c| {
-                        (c.at.0 as i32 - saved.at.0 as i32).abs() <= GEOMETRY_TOLERANCE
-                            && (c.at.1 as i32 - saved.at.1 as i32).abs() <= GEOMETRY_TOLERANCE
-                            && (c.size.0 as i32 - saved.size.0 as i32).abs() <= GEOMETRY_TOLERANCE
-                            && (c.size.1 as i32 - saved.size.1 as i32).abs() <= GEOMETRY_TOLERANCE
-                    })
-                })
-                .count();
-            (ok, placed.len())
-        })
-    };
-    if let Some((ok, checked)) = verified {
-        if ok == checked {
-            println!("Workspace {}: {ok} of {checked} tiled windows are at their saved geometry", key.0);
-        } else {
-            println!("Warning: workspace {}: only {ok} of {checked} tiled windows are at their saved geometry", key.0);
-        }
-    }
-    st.report.flushes.push(FlushReport { workspace: key.0, windows: count, fallback, steered, pointer_moved, verified });
+    st.report.flushes.push(FlushReport { workspace: key.0, windows: count, fallback, steered, pointer_moved });
 }
 
-/// Flush every workspace whose queue is ready
+/// Flush every workspace whose queue is ready. The workspace the load started on waits for the
+/// end: windows are born on it, so it can only be rebuilt once the other workspaces have taken
+/// their staged windows away.
 fn flush_ready(host: &dyn Host, st: &mut LoadState) {
+    let deferred = if st.queue.is_launching() { st.start_ws } else { None };
     for key in st.queue.ready() {
-        flush_workspace(host, st, &key);
+        if Some(key.0) != deferred {
+            flush_workspace(host, st, &key);
+        }
     }
 }
 
 fn flush_all(host: &dyn Host, st: &mut LoadState) {
-    for key in st.queue.all_held() {
+    let mut keys = st.queue.all_held();
+    // the start workspace last
+    keys.sort_by_key(|k| Some(k.0) == st.start_ws);
+    for key in keys {
         flush_workspace(host, st, &key);
     }
 }
@@ -1055,11 +1170,23 @@ fn flush_all(host: &dyn Host, st: &mut LoadState) {
 /// Place every live window that claims a saved client; returns the windows claimed now.
 /// Tiled claims are held and placed together once their workspace is ready.
 fn place_live(host: &dyn Host, st: &mut LoadState, live: &[Client], phase: Option<Phase>) -> Vec<Address> {
+    attribute_owners(host, st, live);
     let mut claimed = vec![];
     for window in live.iter().filter(|c| c.mapped && !st.protected.contains(&c.address)) {
-        let own: &[usize] = match phase {
-            Some(p) if !p.before.contains(&window.address) => p.own,
-            _ => &[],
+        // Bound by provenance when /proc proves whose window it is, else by the resume phase
+        let owned: Vec<usize> = st
+            .owners
+            .get(&window.address)
+            .and_then(|&i| st.plan.entries[i].group.as_ref())
+            .map(|g| g.saved.clone())
+            .unwrap_or_default();
+        let own: &[usize] = if !owned.is_empty() {
+            &owned
+        } else {
+            match phase {
+                Some(p) if !p.before.contains(&window.address) => p.own,
+                _ => &[],
+            }
         };
         if let Some((saved_index, wanted)) = st.placer.assign_bound(window, own, &st.reserved) {
             if st.queue.holds(&wanted) {
@@ -1067,6 +1194,9 @@ fn place_live(host: &dyn Host, st: &mut LoadState, live: &[Client], phase: Optio
             } else {
                 apply(host, window, &wanted);
                 st.report.placed += 1;
+                if crate::queue::is_queued(&wanted) {
+                    st.placed_tiled.push((window.address.clone(), saved_index));
+                }
             }
             claimed.push(window.address.clone());
         }
@@ -1082,6 +1212,7 @@ fn settle_group(
     st: &mut LoadState,
     before: &HashSet<Address>,
     own: &[usize],
+    index: usize,
     expected: usize,
     claimed: &mut usize,
 ) {
@@ -1090,7 +1221,10 @@ fn settle_group(
         host.pause();
         stable += 1;
         let Ok(live) = host.clients() else { continue };
-        let new = place_live(host, st, &live, Some(Phase { before, own })).into_iter().filter(|a| !before.contains(a)).count();
+        let new = place_live(host, st, &live, Some(Phase { before, own, index }))
+            .into_iter()
+            .filter(|a| !before.contains(a) && counts_for(st, a, index))
+            .count();
         if new > 0 {
             *claimed += new;
             stable = 0;
@@ -1106,13 +1240,14 @@ fn fulfil_group(
     host: &dyn Host,
     st: &mut LoadState,
     entry: &ExecEntry,
+    index: usize,
     group: &GroupInfo,
     before: &HashSet<Address>,
     mut claimed: usize,
 ) {
     let expected = group.saved.len();
     let own = own_saves(entry);
-    settle_group(host, st, before, own, expected, &mut claimed);
+    settle_group(host, st, before, own, index, expected, &mut claimed);
     let mut reinvocations = 0;
     if claimed > 0 {
         let bound = expected.saturating_sub(claimed);
@@ -1122,7 +1257,7 @@ fn fulfil_group(
             if host.send(&Op::Exec(entry.command.clone())).is_err() {
                 break;
             }
-            settle_group(host, st, before, own, expected, &mut claimed);
+            settle_group(host, st, before, own, index, expected, &mut claimed);
         }
     }
     if claimed < expected {
@@ -1155,9 +1290,14 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
         placer: Placer::new(if plan.place_by_class { plan.saved.clone() } else { vec![] }),
         queue: if plan.place_by_class { PlacementQueue::new(&plan.saved, &plan.entries) } else { PlacementQueue::disabled() },
         protected,
-        pointer_home: if plan.place_by_class { host.cursor_pos() } else { None },
+        pointer_home: if plan.place_by_class { host.pointer_origin() } else { None },
         pointer_moved_by_us: false,
         steering_refused: false,
+        start_ws: if plan.place_by_class { host.active_workspace() } else { None },
+        launched: 0,
+        signatures: plan.entries.iter().map(entry_signature).collect(),
+        owners: HashMap::new(),
+        placed_tiled: vec![],
         reserved: if plan.place_by_class {
             plan.entries.iter().filter(|e| is_resume_entry(e)).filter_map(|e| e.group.as_ref()).flat_map(|g| g.saved.iter().copied()).collect()
         } else {
@@ -1165,12 +1305,22 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
         },
         report: LoadReport::default(),
     };
+    if plan.place_by_class {
+        if let Some(ws) = st.start_ws {
+            println!("Start workspace: {ws} (windows destined for it are born there and are rebuilt in order at the end)");
+        }
+        match st.pointer_home {
+            Some((x, y)) => println!("Pointer at load start: {x},{y}"),
+            None => println!("Pointer at load start: unknown (it will not be restored)"),
+        }
+    }
 
-    for entry in &plan.entries {
+    for (index, entry) in plan.entries.iter().enumerate() {
         let before: HashSet<Address> = host
             .clients()
             .map(|c| c.into_iter().map(|c| c.address).collect())
             .unwrap_or_default();
+        st.launched = index + 1;
         if let Err(e) = host.send(&Op::Exec(entry.command.clone())) {
             println!("Warning: failed to launch '{}': {e}", entry.command);
             st.queue.entry_done(&plan.saved, entry);
@@ -1183,12 +1333,14 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
             let Ok(live) = host.clients() else { continue };
             if plan.place_by_class {
                 let own = own_saves(entry);
-                claimed += place_live(host, &mut st, &live, Some(Phase { before: &before, own }))
+                claimed += place_live(host, &mut st, &live, Some(Phase { before: &before, own, index }))
                     .into_iter()
-                    .filter(|a| !before.contains(a))
+                    .filter(|a| !before.contains(a) && counts_for(&st, a, index))
                     .count();
             }
-            let new_window = live.iter().find(|c| c.mapped && !before.contains(&c.address));
+            // a window that /proc shows belongs to another entry is not the one being waited for
+            let new_window =
+                live.iter().find(|c| c.mapped && !before.contains(&c.address) && counts_for(&st, &c.address, index));
             if let Some(window) = new_window {
                 if !plan.place_by_class {
                     apply(host, window, &desired_from_rules(window, &entry.rules));
@@ -1198,7 +1350,7 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
             }
         }
         if let (true, Some(group)) = (plan.place_by_class, entry.group.as_ref()) {
-            fulfil_group(host, &mut st, entry, group, &before, claimed);
+            fulfil_group(host, &mut st, entry, index, group, &before, claimed);
         }
         st.queue.entry_done(&plan.saved, entry);
         flush_ready(host, &mut st);
@@ -1228,16 +1380,59 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
         }
     }
 
-    // The loader steered the pointer for the duration of the load: put it back
-    if let (true, Some((x, y))) = (st.pointer_moved_by_us, st.pointer_home) {
-        if !warp_pointer(host, x, y) {
-            println!("Warning: could not put the pointer back at {x},{y}");
-        }
-    }
+    // Focus first: changing workspace can itself move the pointer, so the pointer goes back last
     if let Some(workspace) = plan.restore_workspace {
         let _ = host.send(&Op::FocusWorkspace(workspace));
     }
+    if st.pointer_moved_by_us {
+        match st.pointer_home {
+            Some((x, y)) => {
+                if warp_pointer(host, x, y) {
+                    println!("Pointer restored to {x},{y}");
+                } else {
+                    println!("Warning: could not put the pointer back at {x},{y} (now at {:?})", host.cursor_pos());
+                }
+            }
+            None => println!("Warning: the pointer was steered but its starting position was unknown"),
+        }
+    }
+    verify_final_geometry(host, &mut st);
     st.report
+}
+
+/// Once, after every placement is done: read the compositor's final geometry back and compare each
+/// placed tiled window with its save, per workspace. Earlier reads are mid-assembly (a workspace
+/// that is still filling reads wrong; one that reads right can be broken by a later arrival).
+fn verify_final_geometry(host: &dyn Host, st: &mut LoadState) {
+    if st.placed_tiled.is_empty() {
+        return;
+    }
+    host.pause();
+    host.pause();
+    let Ok(after) = host.clients() else { return };
+    let mut by_ws: std::collections::BTreeMap<i32, WorkspaceCheck> = Default::default();
+    for (address, index) in &st.placed_tiled {
+        let saved = &st.plan.saved[*index];
+        let check = by_ws.entry(saved.workspace.id).or_insert(WorkspaceCheck {
+            workspace: saved.workspace.id,
+            at_saved: 0,
+            checked: 0,
+            off: vec![],
+        });
+        check.checked += 1;
+        let ok = after.iter().find(|c| c.address == *address).is_some_and(|c| {
+            (c.at.0 as i32 - saved.at.0 as i32).abs() <= GEOMETRY_TOLERANCE
+                && (c.at.1 as i32 - saved.at.1 as i32).abs() <= GEOMETRY_TOLERANCE
+                && (c.size.0 as i32 - saved.size.0 as i32).abs() <= GEOMETRY_TOLERANCE
+                && (c.size.1 as i32 - saved.size.1 as i32).abs() <= GEOMETRY_TOLERANCE
+        });
+        if ok {
+            check.at_saved += 1;
+        } else {
+            check.off.push(saved.title.clone());
+        }
+    }
+    st.report.verification = by_ws.into_values().collect();
 }
 
 #[cfg(test)]
@@ -1544,6 +1739,12 @@ mod tests {
         warp: Cell<bool>,
         /// A dwindle layout simulation: moving a window onto a workspace splits the leaf nearest the pointer
         sim: Cell<bool>,
+        /// Process info per window pid, for launch provenance
+        procs: RefCell<std::collections::HashMap<i32, ProcessInfo>>,
+        /// The workspace visible when the load starts
+        start: Cell<i32>,
+        /// Where the pointer was before the load touched anything (default: wherever it is)
+        origin: Cell<Option<(i32, i32)>>,
         leaves: RefCell<std::collections::HashMap<i32, Vec<(Address, crate::dwindle::Rect)>>>,
     }
 
@@ -1563,7 +1764,25 @@ mod tests {
                 hide: RefCell::new(None),
                 warp: Cell::new(true),
                 sim: Cell::new(false),
+                procs: RefCell::new(Default::default()),
+                start: Cell::new(1),
+                origin: Cell::new(None),
                 leaves: RefCell::new(Default::default()),
+            }
+        }
+
+        /// A window leaves its workspace for a special one. Only whole-workspace evacuations are
+        /// simulated (collapsing a partial tree is not modelled, so a partial removal panics)
+        fn sim_park(&self, window: &Address) {
+            let mut leaves = self.leaves.borrow_mut();
+            for tree in leaves.values_mut() {
+                if let Some(at) = tree.iter().position(|(a, _)| a == window) {
+                    tree.remove(at);
+                }
+            }
+            for (_, c) in self.windows.borrow_mut().iter_mut().filter(|(_, c)| c.address == *window) {
+                c.workspace.id = -98;
+                c.workspace.name = "special:hyprsession-stage".to_string();
             }
         }
 
@@ -1635,8 +1854,11 @@ mod tests {
                     !(c.address == *addr && resist.get(&c.pid).copied().unwrap_or(0) == 0)
                 });
             }
-            if let (Op::MoveToWorkspace { window, workspace: crate::dispatch::WorkspaceTarget::Id(ws) }, true) = (op, self.sim.get()) {
-                self.sim_insert(window, *ws);
+            if let (Op::MoveToWorkspace { window, workspace }, true) = (op, self.sim.get()) {
+                match workspace {
+                    crate::dispatch::WorkspaceTarget::Id(ws) => self.sim_insert(window, *ws),
+                    crate::dispatch::WorkspaceTarget::Special(_) => self.sim_park(window),
+                }
             }
             if let (Op::MoveCursor { x, y }, true) = (op, self.warp.get()) {
                 self.cursor.set(Some((*x, *y)));
@@ -1657,7 +1879,9 @@ mod tests {
                 self.windows.borrow_mut().retain(|(_, c)| c.pid != pid);
             }
         }
-        fn active_workspace(&self) -> Option<i32> { Some(1) }
+        fn active_workspace(&self) -> Option<i32> { Some(self.start.get()) }
+        fn process(&self, pid: i32) -> Option<ProcessInfo> { self.procs.borrow().get(&pid).cloned() }
+        fn pointer_origin(&self) -> Option<(i32, i32)> { self.origin.get().or(self.cursor.get()) }
         fn pause(&self) {
             self.tick.set(self.tick.get() + 1);
             self.pauses.set(self.pauses.get() + 1);
@@ -2530,7 +2754,7 @@ mod tests {
                 let (b, report, host) = simulated_load(&a, pointer, true);
                 assert_eq!(geometry(&b), geometry(&a), "pointer {pointer:?}: load of A");
                 assert!(report.flushes[0].steered);
-                assert_eq!(report.flushes[0].verified, Some((3, 3)));
+                assert_eq!(report.verification, vec![WorkspaceCheck { workspace: 7, at_saved: 3, checked: 3, off: vec![] }]);
                 // the pointer is where the user left it
                 assert_eq!(host.cursor.get(), Some(pointer));
                 // and the next generation, with the pointer somewhere else again, is identical
@@ -2547,7 +2771,7 @@ mod tests {
         let (b, report, _) = simulated_load(&a, (300, 900), false);
         assert_ne!(geometry(&b), geometry(&a));
         assert!(!report.flushes[0].steered);
-        assert_eq!(report.flushes[0].verified.map(|(ok, n)| ok < n), Some(true), "the load notices");
+        assert!(report.verification[0].at_saved < report.verification[0].checked, "the load notices");
     }
 
     #[test]
@@ -2600,5 +2824,204 @@ mod tests {
         assert_eq!(host.cursor.get(), Some((123, 456)));
         let warps = host.sent.borrow().iter().filter(|o| matches!(o, Op::MoveCursor { .. })).count();
         assert_eq!(warps, 3, "one refused warp is retried three times, then given up");
+    }
+
+    // ---- round 4: provenance, final verification, the start workspace, the pointer's origin
+
+    fn proc_for(host: &FakeHost, pid: i32, argv: &[&str], cwd: &str) {
+        host.procs.borrow_mut().insert(
+            pid,
+            ProcessInfo { argv: argv.iter().map(|s| s.to_string()).collect(), cwd: Some(cwd.to_string()) },
+        );
+    }
+
+    fn foot_with_pid(n: i16, pid: i32, ws: i32) -> Client {
+        let mut c = foot_window(n);
+        c.pid = pid;
+        c.workspace.id = ws;
+        c.workspace.name = ws.to_string();
+        c
+    }
+
+    /// Two plain terminals launched from different directories, saved on different workspaces
+    /// with the same generic title. X (ws 3) is launched first and its window is SLOW; Y (ws 10)
+    /// is quick. By timing and title alone Y's window is the first generic terminal seen and
+    /// takes X's save.
+    fn interleaved(with_provenance: bool) -> Vec<(String, i32)> {
+        let saves = vec![
+            client("foot", "mike@omarchy:~", 3, false, (12, 38), (941, 1030)),
+            client("foot", "mike@omarchy:~", 10, false, (12, 38), (941, 1030)),
+        ];
+        let mut x = group_entry("foot /x", vec![0]);
+        x.command = "cd /x && foot".into();
+        let mut y = group_entry("foot /y", vec![1]);
+        y.command = "cd /y && foot".into();
+        let host = FakeHost::new(
+            vec![],
+            vec![vec![(LAUNCH_WAIT_TICKS + 20, foot_with_pid(0, 700, 9))], vec![(1, foot_with_pid(1, 701, 9))]],
+        );
+        if with_provenance {
+            proc_for(&host, 700, &["foot"], "/x");
+            proc_for(&host, 701, &["/usr/bin/foot"], "/y");
+        }
+        let mut plan = plan_for(vec![x, y], saves);
+        plan.tail_ticks = 3 * LAUNCH_WAIT_TICKS;
+        run_load(&host, &plan);
+        let mut got = moves_to(&host);
+        got.sort();
+        got
+    }
+
+    #[test]
+    fn test_a_window_launched_for_one_entry_cannot_be_bound_to_another_entry_that_is_outstanding() {
+        // X's window (0xf00) belongs on ws 3, Y's (0xf01) on ws 10, whichever arrives first
+        assert_eq!(interleaved(true), vec![("0xf00".to_string(), 3), ("0xf01".to_string(), 10)]);
+        // control: without /proc provenance the quick window takes the first generic save, crossing them
+        assert_eq!(interleaved(false), vec![("0xf00".to_string(), 10), ("0xf01".to_string(), 3)]);
+    }
+
+    #[test]
+    fn test_a_workspace_waits_for_its_late_window_instead_of_closing_its_phase() {
+        // ws 3 has two tiled saves; the second app's window arrives long after its launch phase.
+        // The workspace is not flushed half-built: both are placed together, in schedule order,
+        // and the final check sees both at their saved geometry
+        let saves = vec![
+            client("app0", "t", 3, false, (12, 38), (941, 1030)),
+            client("app1", "t", 3, false, (967, 38), (941, 1030)),
+        ];
+        let (entries, mut scripts) = launching(&saves, &[0, 1]);
+        scripts[1] = vec![(LAUNCH_WAIT_TICKS + SETTLE_TICKS + 20, live_window("app1", 1))];
+        let host = FakeHost::new(vec![], scripts).dwindle();
+        host.sim.set(true);
+        let mut plan = plan_for(entries, saves);
+        plan.tail_ticks = 3 * LAUNCH_WAIT_TICKS;
+        let report = run_load(&host, &plan);
+        assert_eq!(report.flushes.len(), 1, "one flush for the whole workspace");
+        assert_eq!(report.flushes[0].windows, 2);
+        assert_eq!(report.verification, vec![WorkspaceCheck { workspace: 3, at_saved: 2, checked: 2, off: vec![] }]);
+        assert_eq!(moved(&host), vec!["0xa00", "0xa01"]);
+    }
+
+    #[test]
+    fn test_verification_is_read_once_at_the_end_and_counts_late_placements() {
+        // a workspace that never completes is flushed at the end of the load, and a window placed
+        // after it (on claim) is still part of the one final check
+        let saves = tiled_saves(7, &S4[..3]);
+        let (entries, mut scripts) = launching(&saves, &[0, 1, 2]);
+        scripts[2] = vec![];
+        let host = FakeHost::new(vec![], scripts).dwindle();
+        let report = run_load(&host, &plan_for(entries, saves));
+        // not simulating the compositor: the windows are not at their saved geometry, and it says so
+        assert_eq!(report.verification.len(), 1);
+        assert_eq!((report.verification[0].workspace, report.verification[0].checked), (7, 2));
+        assert_eq!(report.verification[0].off.len(), 2);
+    }
+
+    #[test]
+    fn test_the_start_workspace_is_parked_and_rebuilt_in_schedule_order() {
+        // windows destined for the workspace the load started on are born in its tree; they are
+        // moved off to the stage and back in the steered order
+        let saves = shape_saves(9, &WS9_C);
+        let launch: Vec<usize> = (0..3).collect();
+        let (entries, scripts) = launching(&saves, &launch);
+        let host = FakeHost::new(vec![], scripts).dwindle();
+        host.sim.set(true);
+        host.start.set(9);
+        host.cursor.set(Some((123, 456)));
+        let report = run_load(&host, &plan_for(entries, saves));
+        let sent = host.sent.borrow();
+        let first_park = sent.iter().position(|o| matches!(o, Op::MoveToWorkspace { workspace: crate::dispatch::WorkspaceTarget::Special(_), .. })).unwrap();
+        let first_back = sent.iter().position(|o| matches!(o, Op::MoveToWorkspace { workspace: crate::dispatch::WorkspaceTarget::Id(9), .. })).unwrap();
+        let parks = sent.iter().filter(|o| matches!(o, Op::MoveToWorkspace { workspace: crate::dispatch::WorkspaceTarget::Special(_), .. })).count();
+        assert_eq!(parks, 3);
+        assert!(first_park < first_back);
+        drop(sent);
+        assert_eq!(report.verification, vec![WorkspaceCheck { workspace: 9, at_saved: 3, checked: 3, off: vec![] }]);
+        assert!(report.flushes[0].steered);
+    }
+
+    #[test]
+    fn test_the_start_workspace_is_left_alone_when_it_holds_windows_the_load_does_not_own() {
+        let saves = shape_saves(9, &WS9_C);
+        let (entries, scripts) = launching(&saves, &[0, 1, 2]);
+        let stranger = foot_with_pid(40, 900, 9);
+        let host = FakeHost::new(vec![stranger], scripts).dwindle();
+        host.start.set(9);
+        run_load(&host, &plan_for(entries, saves));
+        let parked = host.sent.borrow().iter().any(|o| matches!(o, Op::MoveToWorkspace { workspace: crate::dispatch::WorkspaceTarget::Special(_), .. }));
+        assert!(!parked, "an unrelated window would be swept into the rebuild");
+    }
+
+    #[test]
+    fn test_the_pointer_goes_back_to_where_it_was_before_anything_happened_and_after_the_focus() {
+        // the pointer has moved by the time run_load starts (windows were closed first)
+        let saves = shape_saves(7, &WS9_C);
+        let (entries, scripts) = launching(&saves, &[0, 1, 2]);
+        let host = FakeHost::new(vec![], scripts).dwindle();
+        host.sim.set(true);
+        host.origin.set(Some((111, 222)));
+        host.cursor.set(Some((1866, 121)));
+        let mut plan = plan_for(entries, saves);
+        plan.restore_workspace = Some(4);
+        run_load(&host, &plan);
+        assert_eq!(host.cursor.get(), Some((111, 222)));
+        let sent = host.sent.borrow();
+        let focus = sent.iter().position(|o| matches!(o, Op::FocusWorkspace(4))).unwrap();
+        let last_warp = sent.iter().rposition(|o| matches!(o, Op::MoveCursor { .. })).unwrap();
+        assert!(focus < last_warp, "focusing can move the pointer, so it is restored after it");
+    }
+
+    #[test]
+    fn test_entry_signatures_and_process_matching() {
+        let mut e = group_entry("x", vec![0]);
+        e.command = "cd /home/m && foot --working-directory=/p".into();
+        let sig = entry_signature(&e).unwrap();
+        assert_eq!(sig, (vec!["foot".to_string(), "--working-directory=/p".to_string()], Some("/home/m".to_string())));
+        let info = |argv: &[&str], cwd: &str| ProcessInfo { argv: argv.iter().map(|s| s.to_string()).collect(), cwd: Some(cwd.into()) };
+        assert!(process_matches(&sig, &info(&["/usr/bin/foot", "--working-directory=/p"], "/home/m")));
+        assert!(!process_matches(&sig, &info(&["foot", "--working-directory=/p"], "/elsewhere")));
+        assert!(!process_matches(&sig, &info(&["foot"], "/home/m")));
+        e.command = "foot".into();
+        assert_eq!(entry_signature(&e).unwrap().1, None);
+    }
+
+    // The round-3 fixtures (brief section 3), as geometry: WS4 = V(H(foot, playcall), Lions); WS10 = V(brave, H(foot, codex))
+    const FIXTURE_WS4: [(i16, i16, i16, i16); 3] = [(12, 38, 953, 546), (967, 38, 1908, 1068), (12, 560, 953, 1068)];
+    const FIXTURE_WS10: [(i16, i16, i16, i16); 3] = [(12, 38, 953, 1068), (967, 38, 1908, 546), (967, 560, 1908, 1068)];
+
+    #[test]
+    fn test_ws4_fixture_round_trips_even_when_the_first_window_of_the_tree_arrives_last() {
+        // the occupant of the root's first leaf (the linked terminal) is the slow one; launches run
+        // Lions, playcall-gui, then it. Nothing is placed until all three are there, then in schedule order.
+        let saves = shape_saves(4, &FIXTURE_WS4);
+        let (entries, mut scripts) = launching(&saves, &[1, 2, 0]);
+        scripts[2] = vec![(LAUNCH_WAIT_TICKS + SETTLE_TICKS + 30, live_window("app0", 0))];
+        let host = FakeHost::new(vec![], scripts).dwindle();
+        host.sim.set(true);
+        host.cursor.set(Some((1866, 121)));
+        let mut plan = plan_for(entries, saves.clone());
+        plan.tail_ticks = 4 * LAUNCH_WAIT_TICKS;
+        let report = run_load(&host, &plan);
+        assert_eq!(report.flushes.len(), 1);
+        assert_eq!(report.verification, vec![WorkspaceCheck { workspace: 4, at_saved: 3, checked: 3, off: vec![] }]);
+        // and the next generation, pointer elsewhere, is the same
+        let (b, _, _) = simulated_load(&saves, (300, 900), true);
+        assert_eq!(geometry(&b), geometry(&saves));
+    }
+
+    #[test]
+    fn test_ws10_fixture_round_trips_when_it_is_the_start_workspace() {
+        let saves = shape_saves(10, &FIXTURE_WS10);
+        let (entries, scripts) = launching(&saves, &[0, 1, 2]);
+        // the windows are born on ws 10 (the load was started there)
+        let scripts: Vec<Vec<(u64, Client)>> = scripts
+            .into_iter()
+            .map(|v| v.into_iter().map(|(d, mut c)| { c.workspace.id = 10; c.workspace.name = "10".into(); (d, c) }).collect())
+            .collect();
+        let host = FakeHost::new(vec![], scripts).dwindle();
+        host.sim.set(true);
+        host.start.set(10);
+        let report = run_load(&host, &plan_for(entries, saves));
+        assert_eq!(report.verification, vec![WorkspaceCheck { workspace: 10, at_saved: 3, checked: 3, off: vec![] }]);
     }
 }
