@@ -863,8 +863,6 @@ struct LoadState<'a> {
 struct Phase<'a> {
     before: &'a HashSet<Address>,
     own: &'a [usize],
-    /// Index of the entry being waited for
-    index: usize,
 }
 
 /// The special workspace windows are parked on while the workspace they were born on is rebuilt
@@ -1221,7 +1219,7 @@ fn settle_group(
         host.pause();
         stable += 1;
         let Ok(live) = host.clients() else { continue };
-        let new = place_live(host, st, &live, Some(Phase { before, own, index }))
+        let new = place_live(host, st, &live, Some(Phase { before, own }))
             .into_iter()
             .filter(|a| !before.contains(a) && counts_for(st, a, index))
             .count();
@@ -1333,7 +1331,7 @@ pub fn run_load(host: &dyn Host, plan: &LoadPlan) -> LoadReport {
             let Ok(live) = host.clients() else { continue };
             if plan.place_by_class {
                 let own = own_saves(entry);
-                claimed += place_live(host, &mut st, &live, Some(Phase { before: &before, own, index }))
+                claimed += place_live(host, &mut st, &live, Some(Phase { before: &before, own }))
                     .into_iter()
                     .filter(|a| !before.contains(a) && counts_for(&st, a, index))
                     .count();
